@@ -1,0 +1,358 @@
+[
+    {
+        "telegram_id": 317111945,
+        "name": "Виталий Векшин",
+        "role": "admin",
+        "observed_store_ids": [
+            1,
+            2,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 388421685,
+        "name": "Егор Дмитриевич",
+        "role": "seller",
+        "observed_store_ids": [
+            6
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 444102799,
+        "name": "Artem Ivanovich",
+        "role": "seller",
+        "observed_store_ids": [
+            5
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 485596079,
+        "name": "Лилия",
+        "role": "admin",
+        "observed_store_ids": [
+            5
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 527708218,
+        "name": "Илья Лавров",
+        "role": "seller",
+        "observed_store_ids": [
+            3,
+            5,
+            7,
+            10
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 662961697,
+        "name": "𝐕𝐚𝐥𝐞𝐫𝐲🫧",
+        "role": "seller",
+        "observed_store_ids": [
+            5
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 753972230,
+        "name": "Xxxx",
+        "role": "admin",
+        "observed_store_ids": [
+            2,
+            3,
+            9,
+            10
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 760798641,
+        "name": "Дарья",
+        "role": "seller",
+        "observed_store_ids": [
+            2
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 874062810,
+        "name": "Вольфрам Вещенко",
+        "role": "seller",
+        "observed_store_ids": [
+            6
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 993228149,
+        "name": "𝐿",
+        "role": "seller",
+        "observed_store_ids": [
+            8
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 1264382128,
+        "name": "KDank",
+        "role": "seller",
+        "observed_store_ids": [
+            6
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 1373786463,
+        "name": "Марина Фролова",
+        "role": "seller",
+        "observed_store_ids": [
+            4
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 1473253779,
+        "name": "Алёнка👻",
+        "role": "seller",
+        "observed_store_ids": [
+            2
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 1686177449,
+        "name": "КСЕНИЯ💞",
+        "role": "seller",
+        "observed_store_ids": [
+            4
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 1897263374,
+        "name": "Алена",
+        "role": "seller",
+        "observed_store_ids": [
+            1,
+            3,
+            6,
+            9,
+            10
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 2088401817,
+        "name": "Vika🤍",
+        "role": "seller",
+        "observed_store_ids": [
+            3
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 5143109889,
+        "name": "Anasteisha Осташева",
+        "role": "seller",
+        "observed_store_ids": [
+            7
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 5269008984,
+        "name": "Марина Марина",
+        "role": "seller",
+        "observed_store_ids": [
+            7
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 5527011327,
+        "name": "Дима",
+        "role": "seller",
+        "observed_store_ids": [
+            2
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 6127462869,
+        "name": "Karina Aleksandrovna",
+        "role": "seller",
+        "observed_store_ids": [
+            1,
+            3,
+            4,
+            11
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 6782169613,
+        "name": "{°𝓐𝓵𝓮𝓴𝓼𝓪𝓷𝓭𝓻𝓪°}",
+        "role": "seller",
+        "observed_store_ids": [
+            1
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 7362976497,
+        "name": "Ксеня",
+        "role": "seller",
+        "observed_store_ids": [
+            1,
+            2,
+            6,
+            8,
+            9,
+            10
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 7812983646,
+        "name": "hhhhh",
+        "role": "seller",
+        "observed_store_ids": [
+            3
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 7865659937,
+        "name": "Иван Морозов",
+        "role": "seller",
+        "observed_store_ids": [
+            4
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8285214322,
+        "name": "ПРИЧАЛ 🍻 ПАРКОВЫЙ 8",
+        "role": "seller",
+        "observed_store_ids": [
+            2,
+            7
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8355342487,
+        "name": "Причал🍻 Шоссе Космонавтов 115а",
+        "role": "seller",
+        "observed_store_ids": [
+            1
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8367718914,
+        "name": "ПРИЧАЛ 🍻 БЕЛИНСКОГО 6Б",
+        "role": "seller",
+        "observed_store_ids": [
+            5,
+            7
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8605216481,
+        "name": "ПРИЧАЛ 🍻 ВОЛЬСКАЯ 62",
+        "role": "seller",
+        "observed_store_ids": [
+            3,
+            7
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8638361465,
+        "name": "ПРИЧАЛ 🍻 СЕРЕБРИСТАЯ 7",
+        "role": "seller",
+        "observed_store_ids": [
+            8
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8644778940,
+        "name": "ПРИЧАЛ 🍻 ВОРОНЕЖСКАЯ 13",
+        "role": "seller",
+        "observed_store_ids": [
+            9
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8716611067,
+        "name": "Инна Дмитриевна",
+        "role": "admin",
+        "observed_store_ids": [
+            9
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8716648878,
+        "name": "ПРИЧАЛ🍻 МАКАРЕНКО 48",
+        "role": "seller",
+        "observed_store_ids": [
+            6
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8721216897,
+        "name": "Причал🍻 Маршала Рыбалко99",
+        "role": "seller",
+        "observed_store_ids": [
+            3
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8753390773,
+        "name": "Причал🍻 Яблокова 14",
+        "role": "seller",
+        "observed_store_ids": [
+            4
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8977995871,
+        "name": "Лилия Ураловна",
+        "role": "admin",
+        "observed_store_ids": [
+            5,
+            6
+        ],
+        "active": true
+    },
+    {
+        "telegram_id": 8996763804,
+        "name": "Екатерина Александровна",
+        "role": "admin",
+        "observed_store_ids": [
+            5,
+            8
+        ],
+        "active": true
+    }
+]
