@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Причал Core</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:24px;background:#f5f7fa;color:#111827}
+    .card{max-width:560px;margin:40px auto;background:#fff;border-radius:20px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,.08)}
+    h1{margin:0 0 8px;font-size:28px}.muted{color:#6b7280}.status{margin-top:24px;padding:14px 16px;border-radius:14px;background:#eef2ff}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>⚓ Причал Core</h1>
+    <div class="muted">Единый рабочий центр сети</div>
+    <div class="status" id="status">Проверяем подключение…</div>
+  </div>
+<script>
+  const tg = window.Telegram?.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+  async function run(){
+    const status = document.getElementById('status');
+    try {
+      const r = await fetch('/api/v1/db-health');
+      const data = await r.json();
+      status.textContent = data.status === 'ok' ? '✅ Core подключён к PostgreSQL' : '⚠️ PostgreSQL пока не подключён';
+    } catch (e) {
+      status.textContent = '❌ Ошибка связи с backend';
+    }
+  }
+  run();
+</script>
+</body>
+</html>
