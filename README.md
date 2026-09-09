@@ -243,3 +243,20 @@ Core не будет хранить бизнес-логику AI в MiniApp — 
 13. Saby/AI интеграция;
 14. Alembic migrations + staging branch Neon перед production.
 
+
+## Bothost deployment (important)
+
+This is a **Python** project. In Bothost set **Main file / entrypoint** explicitly to:
+
+`main.py`
+
+Do not select `miniapp/client.js` as an entrypoint. The files in `miniapp/` are browser-side static assets served by FastAPI.
+
+Recommended Bothost settings:
+- Platform: Telegram
+- Language: Python
+- Main file: `main.py`
+- Port: `5000`
+- Custom Dockerfile: disabled
+
+If the build log contains `npm ci`, `npm install`, or `CMD ["node", ...]`, Bothost has detected the frontend JavaScript as the server entrypoint. Re-check the Main file field and redeploy.
