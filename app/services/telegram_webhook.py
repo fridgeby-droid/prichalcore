@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import select
 from app.db.database import session_scope
-from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee,KnowledgeMediaUploadRequest,KnowledgeMedia
+from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee,KnowledgeMediaUploadRequest,KnowledgeMedia,TrainingQuestionMediaRequest,TrainingQuestion
 from app.services.telegram import send_message,miniapp_keyboard
 
 
@@ -67,6 +67,19 @@ def handle_update(update:dict):
             user=db.scalar(select(User).where(User.telegram_id==tid))
             if not user:
                 send_message(tid,"Сначала откройте MiniApp и авторизуйтесь.");return
+            test_req=db.scalar(select(TrainingQuestionMediaRequest).where(TrainingQuestionMediaRequest.user_id==user.id,TrainingQuestionMediaRequest.status=="waiting",TrainingQuestionMediaRequest.expires_at>datetime.utcnow()).order_by(TrainingQuestionMediaRequest.created_at.desc()))
+            if test_req:
+                q=db.get(TrainingQuestion,test_req.question_id)
+                if not q:
+                    test_req.status="expired"
+                    send_message(tid,"Вопрос теста не найден.");return
+                p=photos[-1]
+                q.image_telegram_file_id=p["file_id"]
+                q.image_telegram_file_unique_id=p.get("file_unique_id")
+                q.image_mime_type="image/jpeg"
+                test_req.status="done"
+                send_message(tid,"✅ Фото добавлено к вопросу теста. Вернитесь в редактор.")
+                return
             kb_req=db.scalar(select(KnowledgeMediaUploadRequest).where(KnowledgeMediaUploadRequest.user_id==user.id,KnowledgeMediaUploadRequest.kind=="photo",KnowledgeMediaUploadRequest.status=="waiting",KnowledgeMediaUploadRequest.expires_at>datetime.utcnow()).order_by(KnowledgeMediaUploadRequest.created_at.desc()))
             if kb_req:
                 p=photos[-1]

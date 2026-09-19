@@ -31,15 +31,15 @@ async def lifespan(app:FastAPI):
     yield
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.2",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.3",lifespan=lifespan)
 register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.2","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.3","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.2","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.3","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():
@@ -47,7 +47,7 @@ def database_health():
     except Exception as e:return JSONResponse(status_code=503,content={"status":"error","detail":str(e)})
 
 @app.get("/miniapp")
-def miniapp():return FileResponse(BASE/"miniapp"/"index.html")
+def miniapp():return FileResponse(BASE/"miniapp"/"index.html",headers={"Cache-Control":"no-store, no-cache, must-revalidate, max-age=0","Pragma":"no-cache","Expires":"0"})
 
 @app.get("/setwebhook")
 def webhook_setup():

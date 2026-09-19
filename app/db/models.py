@@ -748,3 +748,110 @@ Index("ix_knowledge_section_parent_active", KnowledgeSection.parent_id, Knowledg
 Index("ix_knowledge_article_section_status", KnowledgeArticle.section_id, KnowledgeArticle.status, KnowledgeArticle.updated_at)
 Index("ix_knowledge_media_article_kind", KnowledgeMedia.article_id, KnowledgeMedia.kind)
 Index("ix_knowledge_link_module_entity", KnowledgeArticleLink.module_key, KnowledgeArticleLink.entity_id)
+
+# --- Testing v1.7.3 --------------------------------------------------------
+
+class TrainingTest(Base):
+    __tablename__ = "training_tests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(240), index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True)  # draft/published/archived
+    linked_article_id: Mapped[int | None] = mapped_column(ForeignKey("knowledge_articles.id", ondelete="SET NULL"), nullable=True, index=True)
+    auto_assign_on_ack: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    auto_due_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pass_percent: Mapped[int] = mapped_column(Integer, default=80)
+    time_limit_minutes: Mapped[int] = mapped_column(Integer, default=20)
+    attempts_allowed: Mapped[int] = mapped_column(Integer, default=1)
+    questions_to_draw: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    shuffle_questions: Mapped[bool] = mapped_column(Boolean, default=True)
+    shuffle_options: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc, index=True)
+
+
+class TrainingQuestion(Base):
+    __tablename__ = "training_questions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    test_id: Mapped[int] = mapped_column(ForeignKey("training_tests.id", ondelete="CASCADE"), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    question_type: Mapped[str] = mapped_column(String(32), default="single", index=True)  # single/multiple/text
+    accepted_text_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    explanation_internal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    image_telegram_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image_telegram_file_unique_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    image_mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class TrainingQuestionOption(Base):
+    __tablename__ = "training_question_options"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("training_questions.id", ondelete="CASCADE"), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class TrainingAssignment(Base):
+    __tablename__ = "training_assignments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    test_id: Mapped[int] = mapped_column(ForeignKey("training_tests.id", ondelete="CASCADE"), index=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), index=True)
+    assigned_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="manual", index=True)  # manual/article_ack
+    status: Mapped[str] = mapped_column(String(32), default="assigned", index=True)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    retry_unlocked: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+    __table_args__ = (UniqueConstraint("test_id", "employee_id", name="uq_training_assignment_test_employee"),)
+
+
+class TrainingAttempt(Base):
+    __tablename__ = "training_attempts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("training_assignments.id", ondelete="CASCADE"), index=True)
+    test_id: Mapped[int] = mapped_column(ForeignKey("training_tests.id", ondelete="CASCADE"), index=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), index=True)
+    attempt_no: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)  # active/submitted/timeout
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    score_percent: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    question_order_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    option_order_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class TrainingAttemptAnswer(Base):
+    __tablename__ = "training_attempt_answers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(ForeignKey("training_attempts.id", ondelete="CASCADE"), index=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("training_questions.id", ondelete="RESTRICT"), index=True)
+    selected_option_ids_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    text_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    answered_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+    __table_args__ = (UniqueConstraint("attempt_id", "question_id", name="uq_training_answer_attempt_question"),)
+
+
+class TrainingQuestionMediaRequest(Base):
+    __tablename__ = "training_question_media_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("training_questions.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="waiting", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+
+
+Index("ix_training_question_test_active", TrainingQuestion.test_id, TrainingQuestion.active, TrainingQuestion.sort_order)
+Index("ix_training_assignment_employee_status", TrainingAssignment.employee_id, TrainingAssignment.status, TrainingAssignment.due_at)
+Index("ix_training_attempt_employee_status", TrainingAttempt.employee_id, TrainingAttempt.status, TrainingAttempt.expires_at)

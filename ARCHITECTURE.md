@@ -191,3 +191,26 @@ InspectionTemplate
 Tables: `knowledge_sections`, `knowledge_articles`, `knowledge_acknowledgements`, `knowledge_media_upload_requests`, `knowledge_media`, `knowledge_article_links`.
 
 Knowledge article content is stored as sanitized editable HTML. Media stays in Telegram and is proxied through the authenticated Core API. Section/subsection access is role-based and inherited through the hierarchy. Article acknowledgements are tied to an internal revision number so editing a required article can require a fresh acknowledgement without storing full version history.
+
+
+## Testing module (v1.7.3)
+
+```text
+TrainingTest
+  ├── KnowledgeArticle (optional link)
+  └── TrainingQuestion
+        ├── TrainingQuestionOption
+        └── Telegram image (file_id)
+
+TrainingAssignment
+  └── TrainingAttempt
+        └── TrainingAttemptAnswer
+```
+
+`TrainingAttempt.expires_at` is the authoritative server-side timer. Only one active attempt is allowed per employee. The MiniApp hides navigation while an attempt is active and re-opens the same attempt after reconnect/restart. Expired attempts are graded and closed server-side.
+
+Question order and option order are frozen per attempt in JSON fields so shuffling cannot change midway through the test. Answer keys are never returned to a regular employee.
+
+A failed attempt locks retry until an editor explicitly unlocks it, subject to the fixed attempt limit and assignment deadline.
+
+When a required knowledge article is acknowledged, published tests linked to that article with `auto_assign_on_ack=true` are assigned automatically.

@@ -487,8 +487,15 @@ def acknowledge(article_id: int, user=Depends(get_current_user), db: Session = D
         return {"ok": True, "acknowledged_at": existing.acknowledged_at}
     employee = db.scalar(select(Employee).where(Employee.user_id == user.id))
     row = KnowledgeAcknowledgement(article_id=a.id, user_id=user.id, employee_id=employee.id if employee else None, revision=a.revision)
-    db.add(row); db.commit(); db.refresh(row)
-    return {"ok": True, "acknowledged_at": row.acknowledged_at}
+    db.add(row); db.flush()
+    # Linked tests may be assigned automatically only after the employee explicitly confirms acknowledgement.
+    try:
+        from app.services.testing import ensure_article_ack_assignments
+        assigned_test_ids = ensure_article_ack_assignments(db, a.id, user.id)
+    except Exception:
+        assigned_test_ids = []
+    db.commit(); db.refresh(row)
+    return {"ok": True, "acknowledged_at": row.acknowledged_at, "test_assignments": assigned_test_ids}
 
 
 @router.get("/acknowledgements/control")
