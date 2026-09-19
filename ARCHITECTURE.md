@@ -231,3 +231,9 @@ When a required knowledge article is acknowledged, published tests linked to tha
 
 ## v1.7.7 Admin Center
 Centralized role matrix, custom roles, global system settings and admin audit log. Disabled modules remain in code and can be re-enabled from system settings.
+
+## UI v1.7.9 — badges & dock
+- Badge values are computed from current actionable statuses, not retained client counters.
+- Client clears missing/zero badge keys on every refresh.
+- Mutating API calls schedule an immediate badge refresh; polling/visibility refresh protects against changes made by other users.
+- Bottom navigation uses a two-row animated dock with theme-colored badges.

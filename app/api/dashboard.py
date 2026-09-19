@@ -124,13 +124,13 @@ def _badge_data(db: Session, user) -> dict[str,int]:
     employee=_employee(db,user)
     if _allowed(db,user,"orders.list"):
         p=_perm(db,user,"orders.list")
-        q=select(func.count(Order.id)).where(Order.status=="new")
+        q=select(func.count(Order.id)).where(Order.status.in_(["new","skipped"]))
         if p["data_scope"]=="own": q=q.where(Order.created_by==user.id)
         else:
             ids=_scope_stores(db,user,"orders.list"); q=q.where(Order.store_id.in_(ids or [-1]))
         result["orders"]=int(db.scalar(q) or 0)
     if _allowed(db,user,"tasks.my") and employee:
-        result["tasks"]=int(db.scalar(select(func.count(TaskAssignee.id)).where(TaskAssignee.employee_id==employee.id,TaskAssignee.status.in_(["new","rejected"]))) or 0)
+        result["tasks"]=int(db.scalar(select(func.count(TaskAssignee.id)).where(TaskAssignee.employee_id==employee.id,TaskAssignee.status=="new")) or 0)
         if _allowed(db,user,"tasks.control"):
             review=int(db.scalar(select(func.count(TaskAssignee.id)).join(TaskV2,TaskV2.id==TaskAssignee.task_id).where(TaskAssignee.status=="review",TaskV2.created_by==user.id)) or 0)
             result["tasks"] += review
@@ -142,7 +142,7 @@ def _badge_data(db: Session, user) -> dict[str,int]:
     if _allowed(db,user,"knowledge.read"):
         result["knowledge"]=len(_visible_required_articles(db,user,employee))
     if _allowed(db,user,"testing.take") and employee:
-        result["testing"]=int(db.scalar(select(func.count(TrainingAssignment.id)).where(TrainingAssignment.employee_id==employee.id,TrainingAssignment.status.in_(["assigned","in_progress","failed"]))) or 0)
+        result["testing"]=int(db.scalar(select(func.count(TrainingAssignment.id)).where(TrainingAssignment.employee_id==employee.id,TrainingAssignment.status=="assigned")) or 0)
     if _allowed(db,user,"inspections.control"):
         minrow=db.get(AppSetting,"min_inspections_per_week")
         target=int(minrow.value_json if minrow and isinstance(minrow.value_json,(int,float)) else 3)
@@ -174,7 +174,7 @@ def _widget_values(db: Session, user) -> dict[str,Any]:
         overdue=int(db.scalar(select(func.count(TaskAssignee.id)).join(TaskV2,TaskV2.id==TaskAssignee.task_id).where(TaskAssignee.employee_id==emp.id,TaskAssignee.status.notin_(["done","cancelled"]),TaskV2.deadline.is_not(None),TaskV2.deadline<now)) or 0)
         result["overdue_tasks"]={"count":overdue}
         req=_visible_required_articles(db,user,emp); result["required_knowledge"]={"count":len(req),"items":[{"id":a.id,"title":a.title} for a in req[:3]]}
-        tests=list(db.scalars(select(TrainingAssignment).where(TrainingAssignment.employee_id==emp.id,TrainingAssignment.status.in_(["assigned","in_progress","failed"])).order_by(TrainingAssignment.created_at.desc()).limit(5)).all())
+        tests=list(db.scalars(select(TrainingAssignment).where(TrainingAssignment.employee_id==emp.id,TrainingAssignment.status=="assigned").order_by(TrainingAssignment.created_at.desc()).limit(5)).all())
         result["assigned_tests"]={"count":len(tests),"items":[{"id":x.test_id,"title":db.get(TrainingTest,x.test_id).title if db.get(TrainingTest,x.test_id) else f"Тест #{x.test_id}","status":x.status} for x in tests[:3]]}
         today_assignment=db.scalar(select(WorkShiftAssignment).where(WorkShiftAssignment.employee_id==emp.id,WorkShiftAssignment.work_date==today).limit(1))
         if today_assignment:
