@@ -655,3 +655,96 @@ class TaskAttachment(Base):
     file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     label: Mapped[str | None] = mapped_column(String(240), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+
+# --- Knowledge base v1.7.2 -------------------------------------------------
+
+class KnowledgeSection(Base):
+    __tablename__ = "knowledge_sections"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("knowledge_sections.id", ondelete="CASCADE"), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(180), index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    role_access: Mapped[list | None] = mapped_column(JSON, nullable=True)  # empty/null = all roles
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+    __table_args__ = (UniqueConstraint("parent_id", "name", name="uq_knowledge_section_parent_name"),)
+
+
+class KnowledgeArticle(Base):
+    __tablename__ = "knowledge_articles"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    section_id: Mapped[int] = mapped_column(ForeignKey("knowledge_sections.id", ondelete="RESTRICT"), index=True)
+    title: Mapped[str] = mapped_column(String(300), index=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_html: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True)  # draft/published/archived
+    tags_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="SET NULL"), nullable=True, index=True)
+    position_tags_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    required_ack: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    author_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc, index=True)
+
+
+class KnowledgeAcknowledgement(Base):
+    __tablename__ = "knowledge_acknowledgements"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("knowledge_articles.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="SET NULL"), nullable=True, index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    acknowledged_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    __table_args__ = (UniqueConstraint("article_id", "user_id", "revision", name="uq_knowledge_ack_article_user_revision"),)
+
+
+class KnowledgeMediaUploadRequest(Base):
+    __tablename__ = "knowledge_media_upload_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("knowledge_articles.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(16), index=True)  # photo/video
+    status: Mapped[str] = mapped_column(String(32), default="waiting", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+
+
+class KnowledgeMedia(Base):
+    __tablename__ = "knowledge_media"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("knowledge_articles.id", ondelete="CASCADE"), index=True)
+    uploaded_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    kind: Mapped[str] = mapped_column(String(16), index=True)  # photo/video
+    telegram_file_id: Mapped[str] = mapped_column(Text)
+    telegram_file_unique_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    file_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    caption: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+
+
+class KnowledgeArticleLink(Base):
+    __tablename__ = "knowledge_article_links"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("knowledge_articles.id", ondelete="CASCADE"), index=True)
+    module_key: Mapped[str] = mapped_column(String(64), index=True)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    label: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+Index("ix_knowledge_section_parent_active", KnowledgeSection.parent_id, KnowledgeSection.active, KnowledgeSection.sort_order)
+Index("ix_knowledge_article_section_status", KnowledgeArticle.section_id, KnowledgeArticle.status, KnowledgeArticle.updated_at)
+Index("ix_knowledge_media_article_kind", KnowledgeMedia.article_id, KnowledgeMedia.kind)
+Index("ix_knowledge_link_module_entity", KnowledgeArticleLink.module_key, KnowledgeArticleLink.entity_id)

@@ -184,3 +184,10 @@ InspectionTemplate
 `Violation.severity`: `low`, `medium`, `high`, `critical`. Из нарушения MiniApp открывает форму постановки задачи с предзаполненными данными; после создания `Violation.task_v2_id` связывает нарушение с задачей.
 
 Норма проверок берётся из `MIN_INSPECTIONS_PER_STORE_PER_WEEK` (по умолчанию 3). Экран контроля считает завершённые проверки по календарной неделе в `APP_TIMEZONE`.
+
+
+## Knowledge Base (v1.7.2)
+
+Tables: `knowledge_sections`, `knowledge_articles`, `knowledge_acknowledgements`, `knowledge_media_upload_requests`, `knowledge_media`, `knowledge_article_links`.
+
+Knowledge article content is stored as sanitized editable HTML. Media stays in Telegram and is proxied through the authenticated Core API. Section/subsection access is role-based and inherited through the hierarchy. Article acknowledgements are tied to an internal revision number so editing a required article can require a fresh acknowledgement without storing full version history.

@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import select
 from app.db.database import session_scope
-from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee
+from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee,KnowledgeMediaUploadRequest,KnowledgeMedia
 from app.services.telegram import send_message,miniapp_keyboard
 
 
@@ -48,12 +48,32 @@ def handle_update(update:dict):
             req.status="done"
             send_message(tid,"✅ Прайс-лист прикреплён к поставщику.")
         return
+    video=msg.get("video")
+    if video:
+        with session_scope() as db:
+            user=db.scalar(select(User).where(User.telegram_id==tid))
+            if not user:
+                send_message(tid,"Сначала откройте MiniApp и авторизуйтесь.");return
+            kb_req=db.scalar(select(KnowledgeMediaUploadRequest).where(KnowledgeMediaUploadRequest.user_id==user.id,KnowledgeMediaUploadRequest.kind=="video",KnowledgeMediaUploadRequest.status=="waiting",KnowledgeMediaUploadRequest.expires_at>datetime.utcnow()).order_by(KnowledgeMediaUploadRequest.created_at.desc()))
+            if not kb_req:
+                send_message(tid,"Сейчас Core не ожидает видео. Сначала нажмите «Добавить видео» в статье базы знаний.");return
+            db.add(KnowledgeMedia(article_id=kb_req.article_id,uploaded_by=user.id,kind="video",telegram_file_id=video["file_id"],telegram_file_unique_id=video.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),file_name=video.get("file_name"),mime_type=video.get("mime_type") or "video/mp4",file_size=video.get("file_size"),caption=msg.get("caption")))
+            kb_req.status="done"
+            send_message(tid,"✅ Видео добавлено в базу знаний. Вернитесь в статью, чтобы вставить его в текст.")
+        return
     photos=msg.get("photo") or []
     if photos:
         with session_scope() as db:
             user=db.scalar(select(User).where(User.telegram_id==tid))
             if not user:
                 send_message(tid,"Сначала откройте MiniApp и авторизуйтесь.");return
+            kb_req=db.scalar(select(KnowledgeMediaUploadRequest).where(KnowledgeMediaUploadRequest.user_id==user.id,KnowledgeMediaUploadRequest.kind=="photo",KnowledgeMediaUploadRequest.status=="waiting",KnowledgeMediaUploadRequest.expires_at>datetime.utcnow()).order_by(KnowledgeMediaUploadRequest.created_at.desc()))
+            if kb_req:
+                p=photos[-1]
+                db.add(KnowledgeMedia(article_id=kb_req.article_id,uploaded_by=user.id,kind="photo",telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),file_name=None,mime_type="image/jpeg",file_size=p.get("file_size"),caption=msg.get("caption")))
+                kb_req.status="done"
+                send_message(tid,"✅ Фото добавлено в базу знаний. Вернитесь в статью, чтобы вставить его в текст.")
+                return
             task_req=db.scalar(select(TaskAttachmentRequest).where(TaskAttachmentRequest.user_id==user.id,TaskAttachmentRequest.kind=="photo",TaskAttachmentRequest.status=="waiting",TaskAttachmentRequest.expires_at>datetime.utcnow()).order_by(TaskAttachmentRequest.created_at.desc()))
             if task_req:
                 p=photos[-1]

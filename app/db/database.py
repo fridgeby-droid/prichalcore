@@ -239,6 +239,26 @@ def _postgres_inspection_upgrade(engine):
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_violations_value_id ON violations(inspection_value_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_violations_task_v2_id ON violations(task_v2_id)"))
 
+
+def _seed_knowledge_sections():
+    from app.db.models import KnowledgeSection
+    get_engine()
+    db = SessionLocal()
+    try:
+        roles = ["seller", "mentor", "manager", "operations_director", "leader", "admin"]
+        seeds = [
+            ("Регламенты", "📘", 10),
+            ("Безопасность", "🛡️", 20),
+            ("Обучение", "🎓", 30),
+        ]
+        for name, icon, order in seeds:
+            row = db.scalar(select(KnowledgeSection).where(KnowledgeSection.parent_id.is_(None), KnowledgeSection.name == name))
+            if not row:
+                db.add(KnowledgeSection(name=name, icon=icon, role_access=roles, sort_order=order, active=True))
+        db.commit()
+    finally:
+        db.close()
+
 def init_db():
     from app.db import models  # noqa: F401
     engine = get_engine()
@@ -249,6 +269,7 @@ def init_db():
         _postgres_handover_upgrade(engine)
         _postgres_inspection_upgrade(engine)
     _seed_employees_from_users()
+    _seed_knowledge_sections()
     _backfill_schedule_employee_ids(engine)
     _backfill_handover_employee_ids(engine)
 
