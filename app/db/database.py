@@ -348,12 +348,12 @@ def _seed_admin_roles():
                 elif key in {"operations_director","leader"}: level="edit"; scope="network"
                 elif key=="manager":
                     scope="stores"
-                    if pk.startswith(("orders.","schedule.","shifts.","tasks.","inspections.","employees.","knowledge.","testing.")): level="edit"
+                    if pk.startswith(("dashboard.","orders.","schedule.","shifts.","tasks.","inspections.","employees.","knowledge.","testing.")): level="edit"
                     if pk.startswith("telegram."): level="view"
                     if pk=="telegram.templates": level="hidden"
                 elif key in {"seller","mentor"}:
                     scope="own"
-                    if pk in {"orders.list","orders.create","orders.edit_new","orders.schedule_view","schedule.my","shifts.submit","shifts.history","tasks.my","knowledge.read","testing.take","testing.catalog"}: level="edit" if pk in {"orders.create","orders.edit_new","shifts.submit","testing.take"} else "view"
+                    if pk in {"dashboard.next_shift","dashboard.my_tasks","dashboard.overdue_tasks","dashboard.required_knowledge","dashboard.assigned_tests","dashboard.handover_due","orders.list","orders.create","orders.edit_new","orders.schedule_view","schedule.my","shifts.submit","shifts.history","tasks.my","knowledge.read","testing.take","testing.catalog"}: level="edit" if pk in {"orders.create","orders.edit_new","shifts.submit","testing.take"} else "view"
                 db.add(RolePermission(role_key=key,permission_key=pk,access_level=level,data_scope=scope))
         for u in db.scalars(select(User)).all():
             if getattr(u,"role_key",None) is None: u.role_key=u.role

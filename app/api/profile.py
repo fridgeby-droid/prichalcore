@@ -149,8 +149,8 @@ def update_profile(payload: ProfilePatch, user=Depends(get_current_user), db: Se
             raise HTTPException(400, "Проверьте адрес электронной почты")
         employee.email = email or None
     if "app_theme" in data:
-        if data["app_theme"] not in {"light", "dark"}:
-            raise HTTPException(400, "Доступны светлая и тёмная темы")
+        if data["app_theme"] not in {"system", "mint", "ocean", "sand", "lavender", "graphite", "light", "dark"}:
+            raise HTTPException(400, "Неизвестная тема оформления")
         employee.app_theme = data["app_theme"]
     if "primary_store_id" in data:
         sid = data["primary_store_id"]

@@ -69,6 +69,13 @@ class EmployeeStore(Base):
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), primary_key=True)
 
 
+
+class DashboardPreference(Base):
+    __tablename__ = "dashboard_preferences"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    layout_json: Mapped[list | dict | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
 class AuthSession(Base):
     __tablename__ = "auth_sessions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
