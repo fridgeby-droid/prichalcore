@@ -214,3 +214,7 @@ Question order and option order are frozen per attempt in JSON fields so shuffli
 A failed attempt locks retry until an editor explicitly unlocks it, subject to the fixed attempt limit and assignment deadline.
 
 When a required knowledge article is acknowledged, published tests linked to that article with `auto_assign_on_ack=true` are assigned automatically.
+
+
+## Личная страница v1.7.4
+`app/api/profile.py` агрегирует персональные данные из Employees, Work Schedule, Tasks v2, Handovers, Knowledge Base и Testing. Персональные редактируемые поля хранятся в `employees`. Фото остаётся в Telegram и связывается через существующие `photo_requests` / `photos`. Личная статистика Saby и достижения пока представлены как расширяемые placeholders.

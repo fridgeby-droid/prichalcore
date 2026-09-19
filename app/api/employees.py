@@ -25,6 +25,10 @@ class EmployeeIn(BaseModel):
     employment_status: str = "working"
     hire_date: date | None = None
     comment: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    primary_store_id: int | None = None
+    app_theme: str = "light"
     telegram_id: int | None = None
     user_id: int | None = None
     store_ids: list[int] = []
@@ -37,6 +41,10 @@ class EmployeePatch(BaseModel):
     employment_status: str | None = None
     hire_date: date | None = None
     comment: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    primary_store_id: int | None = None
+    app_theme: str | None = None
     telegram_id: int | None = None
     user_id: int | None = None
     store_ids: list[int] | None = None
@@ -87,6 +95,10 @@ def employee_dict(db: Session, e: Employee) -> dict[str, Any]:
         "employment_status": e.employment_status,
         "hire_date": e.hire_date.isoformat() if e.hire_date else None,
         "comment": e.comment,
+        "phone": e.phone,
+        "email": e.email,
+        "primary_store_id": e.primary_store_id,
+        "app_theme": e.app_theme,
         "telegram_id": e.telegram_id,
         "user_id": e.user_id,
         "telegram_name": (user.full_name or user.username or str(user.telegram_id)) if user else None,
@@ -153,6 +165,10 @@ def create_employee(payload: EmployeeIn, user=Depends(get_current_user), db: Ses
         employment_status=payload.employment_status,
         hire_date=payload.hire_date,
         comment=payload.comment,
+        phone=payload.phone,
+        email=payload.email,
+        primary_store_id=payload.primary_store_id,
+        app_theme=payload.app_theme,
         telegram_id=payload.telegram_id,
         user_id=payload.user_id,
         active=payload.active,

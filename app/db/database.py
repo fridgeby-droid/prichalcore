@@ -240,6 +240,25 @@ def _postgres_inspection_upgrade(engine):
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_violations_task_v2_id ON violations(task_v2_id)"))
 
 
+
+def _postgres_profile_upgrade(engine):
+    """Add personal profile fields without dropping employee history."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "employees" not in tables:
+        return
+    with engine.begin() as conn:
+        def add_col(table: str, col: str, ddl: str):
+            cols = {x["name"] for x in inspect(conn).get_columns(table)}
+            if col not in cols:
+                conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {ddl}'))
+
+        add_col("employees", "phone", "phone VARCHAR(64)")
+        add_col("employees", "email", "email VARCHAR(240)")
+        add_col("employees", "primary_store_id", "primary_store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL")
+        add_col("employees", "app_theme", "app_theme VARCHAR(16) NOT NULL DEFAULT 'light'")
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employees_primary_store_id ON employees(primary_store_id)"))
+
 def _seed_knowledge_sections():
     from app.db.models import KnowledgeSection
     get_engine()
@@ -268,6 +287,7 @@ def init_db():
         _postgres_schedule_upgrade(engine)
         _postgres_handover_upgrade(engine)
         _postgres_inspection_upgrade(engine)
+        _postgres_profile_upgrade(engine)
     _seed_employees_from_users()
     _seed_knowledge_sections()
     _backfill_schedule_employee_ids(engine)

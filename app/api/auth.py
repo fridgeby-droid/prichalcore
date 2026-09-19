@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.db.database import get_db
-from app.db.models import UserStore, Store
+from app.db.models import UserStore, Store, Employee
 from app.core.security import validate_telegram_init_data, upsert_telegram_user, create_session, get_current_user
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -30,6 +30,7 @@ def telegram_auth(payload: TelegramAuthIn, db: Session = Depends(get_db)):
     else:
         rows = db.execute(select(Store).join(UserStore, UserStore.store_id == Store.id).where(UserStore.user_id == user.id, Store.active.is_(True)).order_by(Store.name)).scalars().all()
         stores = [{"id": s.id, "name": s.name} for s in rows]
+    employee = db.scalar(select(Employee).where(Employee.user_id == user.id))
     return {
         "status": "ok",
         "token": token,
@@ -39,6 +40,7 @@ def telegram_auth(payload: TelegramAuthIn, db: Session = Depends(get_db)):
             "full_name": user.full_name,
             "role": user.role,
             "stores": stores,
+            "theme": (employee.app_theme if employee else "light"),
         },
     }
 
@@ -49,10 +51,12 @@ def me(user=Depends(get_current_user), db: Session = Depends(get_db)):
         rows = db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all()
     else:
         rows = db.execute(select(Store).join(UserStore, UserStore.store_id == Store.id).where(UserStore.user_id == user.id, Store.active.is_(True)).order_by(Store.name)).scalars().all()
+    employee = db.scalar(select(Employee).where(Employee.user_id == user.id))
     return {
         "id": user.id,
         "telegram_id": user.telegram_id,
         "full_name": user.full_name,
         "role": user.role,
         "stores": [{"id": s.id, "name": s.name} for s in rows],
+        "theme": (employee.app_theme if employee else "light"),
     }

@@ -67,6 +67,13 @@ def handle_update(update:dict):
             user=db.scalar(select(User).where(User.telegram_id==tid))
             if not user:
                 send_message(tid,"Сначала откройте MiniApp и авторизуйтесь.");return
+            profile_req=db.scalar(select(PhotoRequest).where(PhotoRequest.user_id==user.id,PhotoRequest.entity_type=="profile_avatar",PhotoRequest.status=="waiting",PhotoRequest.expires_at>datetime.utcnow()).order_by(PhotoRequest.created_at.desc()))
+            if profile_req:
+                p=photos[-1]
+                db.add(Photo(entity_type="profile_avatar",entity_id=profile_req.entity_id,store_id=None,uploaded_by=user.id,telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),label="Фото профиля"))
+                profile_req.status="done"
+                send_message(tid,"✅ Фото профиля обновлено. Откройте Причал Core снова.")
+                return
             test_req=db.scalar(select(TrainingQuestionMediaRequest).where(TrainingQuestionMediaRequest.user_id==user.id,TrainingQuestionMediaRequest.status=="waiting",TrainingQuestionMediaRequest.expires_at>datetime.utcnow()).order_by(TrainingQuestionMediaRequest.created_at.desc()))
             if test_req:
                 q=db.get(TrainingQuestion,test_req.question_id)
