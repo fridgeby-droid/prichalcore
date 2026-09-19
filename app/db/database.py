@@ -307,6 +307,62 @@ def _seed_telegram_message_templates():
     finally:
         db.close()
 
+
+def _postgres_admin_center_upgrade(engine):
+    inspector=inspect(engine)
+    if "users" not in set(inspector.get_table_names()): return
+    with engine.begin() as conn:
+        cols={x["name"] for x in inspect(conn).get_columns("users")}
+        if "role_key" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN role_key VARCHAR(64)"))
+        conn.execute(text("UPDATE users SET role_key=role WHERE role_key IS NULL"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_role_key ON users(role_key)"))
+
+def _seed_admin_roles():
+    from app.db.models import RoleDefinition, RolePermission, User, AppSetting
+    from app.core.permissions import all_keys
+    get_engine(); db=SessionLocal()
+    try:
+        defs=[
+            ("seller","Продавец",True,"seller",False),
+            ("mentor","Наставник",True,"mentor",True),
+            ("manager","Управляющий",True,"manager",False),
+            ("operations_director","Операционный директор",True,"operations_director",False),
+            ("leader","Руководитель",True,"leader",False),
+            ("admin","Администратор",True,"admin",False),
+        ]
+        for key,name,system,base,hidden in defs:
+            r=db.get(RoleDefinition,key)
+            if not r:
+                r=RoleDefinition(key=key,name=name,system=system,base_role=base,hidden=hidden,archived=False);db.add(r)
+            else:
+                r.name=name;r.system=system;r.base_role=base;r.hidden=hidden
+        db.flush()
+        keys=all_keys()
+        for key,name,system,base,hidden in defs:
+            existing={x.permission_key:x for x in db.scalars(select(RolePermission).where(RolePermission.role_key==key)).all()}
+            for pk in keys:
+                if pk in existing: continue
+                level="hidden"; scope="own"
+                if key=="admin": level="edit"; scope="network"
+                elif key in {"operations_director","leader"}: level="edit"; scope="network"
+                elif key=="manager":
+                    scope="stores"
+                    if pk.startswith(("orders.","schedule.","shifts.","tasks.","inspections.","employees.","knowledge.","testing.")): level="edit"
+                    if pk.startswith("telegram."): level="view"
+                    if pk=="telegram.templates": level="hidden"
+                elif key in {"seller","mentor"}:
+                    scope="own"
+                    if pk in {"orders.list","orders.create","orders.edit_new","orders.schedule_view","schedule.my","shifts.submit","shifts.history","tasks.my","knowledge.read","testing.take","testing.catalog"}: level="edit" if pk in {"orders.create","orders.edit_new","shifts.submit","testing.take"} else "view"
+                db.add(RolePermission(role_key=key,permission_key=pk,access_level=level,data_scope=scope))
+        for u in db.scalars(select(User)).all():
+            if getattr(u,"role_key",None) is None: u.role_key=u.role
+        modules=db.get(AppSetting,"module_states")
+        default={"cash":False,"mentoring":False,"plans":False,"ratings":False,"broadcasts":False}
+        if not modules: db.add(AppSetting(key="module_states",value_json=default))
+        db.commit()
+    finally: db.close()
+
 def init_db():
     from app.db import models  # noqa: F401
     engine = get_engine()
@@ -318,9 +374,11 @@ def init_db():
         _postgres_inspection_upgrade(engine)
         _postgres_profile_upgrade(engine)
         _postgres_telegram_upgrade(engine)
+        _postgres_admin_center_upgrade(engine)
     _seed_employees_from_users()
     _seed_knowledge_sections()
     _seed_telegram_message_templates()
+    _seed_admin_roles()
     _backfill_schedule_employee_ids(engine)
     _backfill_handover_employee_ids(engine)
 

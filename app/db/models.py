@@ -31,6 +31,7 @@ class User(Base):
     last_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     full_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     role: Mapped[str] = mapped_column(String(32), default="seller", index=True)
+    role_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
@@ -535,6 +536,38 @@ class AppSetting(Base):
     value_json: Mapped[dict | list | str | int | float | bool | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
 
+
+
+
+class RoleDefinition(Base):
+    __tablename__ = "role_definitions"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), unique=True)
+    system: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    base_role: Mapped[str] = mapped_column(String(32), default="seller", index=True)
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+    role_key: Mapped[str] = mapped_column(ForeignKey("role_definitions.key", ondelete="CASCADE"), primary_key=True)
+    permission_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    access_level: Mapped[str] = mapped_column(String(16), default="hidden", index=True)
+    data_scope: Mapped[str] = mapped_column(String(16), default="own", index=True)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_log"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(120), index=True)
+    entity_type: Mapped[str] = mapped_column(String(120), index=True)
+    entity_id: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    details_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
 
 Index("ix_orders_store_supplier_created", Order.store_id, Order.supplier_id, Order.created_at)
 Index("ix_tasks_assignee_status_deadline", Task.assigned_to, Task.status, Task.deadline)

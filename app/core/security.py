@@ -60,6 +60,7 @@ def upsert_telegram_user(db: Session, tg: dict) -> User:
             last_name=tg.get("last_name"),
             full_name=" ".join(x for x in [tg.get("first_name"), tg.get("last_name")] if x) or str(telegram_id),
             role="admin" if bootstrap else "seller",
+            role_key="admin" if bootstrap else "seller",
             status="active" if bootstrap else "pending",
             active=True,
         )

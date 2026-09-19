@@ -227,3 +227,7 @@ When a required knowledge article is acknowledged, published tests linked to tha
 - `employee_notification_preferences` — персональные настройки типов сообщений.
 - `app/services/notifications.py` — единая точка формирования и доставки сообщений.
 - `app/api/telegram_delivery.py` — управление маршрутами, журналом и повторной отправкой.
+
+
+## v1.7.7 Admin Center
+Centralized role matrix, custom roles, global system settings and admin audit log. Disabled modules remain in code and can be re-enabled from system settings.
