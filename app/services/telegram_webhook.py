@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import select
 from app.db.database import session_scope
-from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee,KnowledgeMediaUploadRequest,KnowledgeMedia,TrainingQuestionMediaRequest,TrainingQuestion
+from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee,KnowledgeMediaUploadRequest,KnowledgeMedia,TrainingQuestionMediaRequest,TrainingQuestion,TelegramDestination
 from app.services.telegram import send_message,miniapp_keyboard
 
 
@@ -12,6 +12,21 @@ def handle_update(update:dict):
     tg_user=msg.get("from") or {}
     if not chat.get("id") or not tg_user.get("id"):return
     tid=int(tg_user["id"]);text=(msg.get("text") or "").strip()
+    if text.split("@")[0]=="/register" and chat.get("type") in {"group","supergroup","channel"}:
+        with session_scope() as db:
+            user=db.scalar(select(User).where(User.telegram_id==tid,User.active.is_(True)))
+            if not user or user.role not in {"manager","operations_director","leader","admin"}:
+                send_message(int(chat["id"]),"⛔ Зарегистрировать группу может управляющий, ОД, руководитель или администратор Причал Core.")
+                return
+            dest=db.scalar(select(TelegramDestination).where(TelegramDestination.chat_id==int(chat["id"])))
+            title=chat.get("title") or chat.get("username") or f"Telegram {chat['id']}"
+            if not dest:
+                dest=TelegramDestination(chat_id=int(chat["id"]),chat_type=chat.get("type") or "group",title=title,username=chat.get("username"),active=True,registered_by_user_id=user.id)
+                db.add(dest);db.flush()
+            else:
+                dest.title=title;dest.username=chat.get("username");dest.chat_type=chat.get("type") or dest.chat_type;dest.active=True;dest.registered_by_user_id=user.id;dest.last_seen_at=datetime.utcnow()
+            send_message(int(chat["id"]),"✅ <b>Группа зарегистрирована в Причал Core</b>\nТеперь откройте Core → Ещё → Telegram → Маршруты и привяжите группу к магазину или поставщику.")
+        return
     if text=="/start":
         send_message(tid,"⚓ <b>Причал Core</b>\nЕдиный рабочий центр сети.",miniapp_keyboard());return
     if text=="/whoami":

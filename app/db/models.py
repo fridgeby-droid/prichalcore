@@ -132,6 +132,8 @@ class Order(Base):
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     status: Mapped[str] = mapped_column(String(32), default="new", index=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    accepted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
 
@@ -859,3 +861,81 @@ class TrainingQuestionMediaRequest(Base):
 Index("ix_training_question_test_active", TrainingQuestion.test_id, TrainingQuestion.active, TrainingQuestion.sort_order)
 Index("ix_training_assignment_employee_status", TrainingAssignment.employee_id, TrainingAssignment.status, TrainingAssignment.due_at)
 Index("ix_training_attempt_employee_status", TrainingAttempt.employee_id, TrainingAttempt.status, TrainingAttempt.expires_at)
+
+# --- Telegram delivery / routing v1.7.5 ------------------------------------
+
+class TelegramDestination(Base):
+    __tablename__ = "telegram_destinations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    chat_type: Mapped[str] = mapped_column(String(32), default="group", index=True)
+    title: Mapped[str] = mapped_column(String(240), index=True)
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    registered_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    registered_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class TelegramRoute(Base):
+    __tablename__ = "telegram_routes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)  # order_accepted / handover_accepted
+    target_type: Mapped[str] = mapped_column(String(32), index=True)  # supplier / store
+    target_id: Mapped[int] = mapped_column(Integer, index=True)
+    destination_id: Mapped[int] = mapped_column(ForeignKey("telegram_destinations.id", ondelete="CASCADE"), index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+    __table_args__ = (UniqueConstraint("event_type", "target_type", "target_id", name="uq_telegram_route_target"),)
+
+
+class TelegramDeliveryLog(Base):
+    __tablename__ = "telegram_delivery_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    entity_type: Mapped[str] = mapped_column(String(64), index=True)
+    entity_id: Mapped[int] = mapped_column(Integer, index=True)
+    destination_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_destinations.id", ondelete="SET NULL"), nullable=True, index=True)
+    recipient_employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="SET NULL"), nullable=True, index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)  # sent/error/skipped
+    dedupe_key: Mapped[str] = mapped_column(String(300), unique=True, index=True)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_json: Mapped[dict | list | str | int | float | bool | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class TelegramMessageTemplate(Base):
+    __tablename__ = "telegram_message_templates"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(240))
+    body_html: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    button_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    button_text: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    button_target: Mapped[str] = mapped_column(String(24), default="miniapp")  # miniapp/custom/none
+    button_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    send_media: Mapped[bool] = mapped_column(Boolean, default=True)
+    media_order: Mapped[str] = mapped_column(String(24), default="text_first")  # text_first/media_first
+    photo_caption: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class EmployeeNotificationPreference(Base):
+    __tablename__ = "employee_notification_preferences"
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+Index("ix_telegram_route_event_target", TelegramRoute.event_type, TelegramRoute.target_type, TelegramRoute.target_id)
+Index("ix_telegram_delivery_entity", TelegramDeliveryLog.entity_type, TelegramDeliveryLog.entity_id, TelegramDeliveryLog.created_at)
+Index("ix_telegram_template_event_active", TelegramMessageTemplate.event_type, TelegramMessageTemplate.active)

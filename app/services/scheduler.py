@@ -13,6 +13,7 @@ from app.db.models import (
     Order, ShiftTemplate, ShiftReport, Task, Inspection, PlanFact
 )
 from app.services.telegram import send_message
+from app.services.notifications import process_pending_personal_deliveries
 
 _scheduler_thread = None
 _stop_event = threading.Event()
@@ -151,8 +152,13 @@ def process_plan_alerts():
                 except Exception:pass
 
 
+
+def process_telegram_delivery_queue():
+    with session_scope() as db:
+        process_pending_personal_deliveries(db, limit=25)
+
 def scheduler_tick():
-    process_broadcasts();process_task_alerts();process_order_deadlines();process_shift_deadlines();process_inspection_control();process_plan_alerts()
+    process_telegram_delivery_queue();process_broadcasts();process_task_alerts();process_order_deadlines();process_shift_deadlines();process_inspection_control();process_plan_alerts()
 
 
 def _loop():

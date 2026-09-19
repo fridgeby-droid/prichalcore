@@ -218,3 +218,12 @@ When a required knowledge article is acknowledged, published tests linked to tha
 
 ## Личная страница v1.7.4
 `app/api/profile.py` агрегирует персональные данные из Employees, Work Schedule, Tasks v2, Handovers, Knowledge Base и Testing. Персональные редактируемые поля хранятся в `employees`. Фото остаётся в Telegram и связывается через существующие `photo_requests` / `photos`. Личная статистика Saby и достижения пока представлены как расширяемые placeholders.
+
+## v1.7.5 — Telegram delivery layer
+
+- `telegram_destinations` — обнаруженные/зарегистрированные рабочие Telegram-группы.
+- `telegram_routes` — маршруты бизнес-событий на группы поставщиков и магазинов.
+- `telegram_delivery_logs` — outbox/audit доставки, защита от дублей и ошибки.
+- `employee_notification_preferences` — персональные настройки типов сообщений.
+- `app/services/notifications.py` — единая точка формирования и доставки сообщений.
+- `app/api/telegram_delivery.py` — управление маршрутами, журналом и повторной отправкой.

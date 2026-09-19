@@ -29,6 +29,7 @@ from app.db.models import (
     User,
 )
 from app.services.telegram import file_download_url, get_file_path
+from app.services.notifications import notify_test_assignment
 
 router = APIRouter(prefix="/api/testing", tags=["testing"])
 EDITOR_ROLES = set(MANAGEMENT_ROLES)
@@ -515,7 +516,7 @@ def assign_test(test_id: int, payload: AssignmentIn, user=Depends(get_current_us
         ids.update(db.scalars(select(EmployeeStore.employee_id).join(Employee, Employee.id == EmployeeStore.employee_id).where(EmployeeStore.store_id.in_(payload.store_ids), Employee.active.is_(True))).all())
     if not ids:
         raise HTTPException(400, "Выберите сотрудников, роль или магазины")
-    created = 0; updated = 0
+    created = 0; updated = 0; created_assignment_ids = []
     for eid in ids:
         e = db.get(Employee, int(eid))
         if not e or not e.active:
@@ -527,7 +528,13 @@ def assign_test(test_id: int, payload: AssignmentIn, user=Depends(get_current_us
                 a.status = "assigned"
             updated += 1
         else:
-            db.add(TrainingAssignment(test_id=test.id, employee_id=e.id, assigned_by=user.id, source="manual", status="assigned", due_at=payload.due_at, retry_unlocked=True)); created += 1
+            a=TrainingAssignment(test_id=test.id, employee_id=e.id, assigned_by=user.id, source="manual", status="assigned", due_at=payload.due_at, retry_unlocked=True)
+            db.add(a); db.flush(); created_assignment_ids.append(a.id); created += 1
+    for aid in created_assignment_ids:
+        try:
+            notify_test_assignment(db, aid)
+        except Exception:
+            pass
     db.commit()
     return {"ok": True, "created": created, "updated": updated, "total": created + updated}
 

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import APP_TIMEZONE
 from app.core.security import get_current_user
 from app.db.database import get_db
+from app.services.notifications import send_order_accepted
 from app.db.models import (
     Category,
     Order,
@@ -111,6 +112,7 @@ def _order_dict(db: Session, o: Order, include_items: bool = True):
     store = db.get(Store, o.store_id)
     supplier = db.get(Supplier, o.supplier_id)
     creator = db.get(User, o.created_by)
+    accepted_by = db.get(User, o.accepted_by) if getattr(o, "accepted_by", None) else None
     data = {
         "id": o.id,
         "store_id": o.store_id,
@@ -121,6 +123,9 @@ def _order_dict(db: Session, o: Order, include_items: bool = True):
         "creator_name": (creator.full_name or creator.username or str(creator.telegram_id)) if creator else "—",
         "status": o.status,
         "comment": o.comment,
+        "accepted_by": getattr(o, "accepted_by", None),
+        "accepted_by_name": (accepted_by.full_name or accepted_by.username or str(accepted_by.telegram_id)) if accepted_by else None,
+        "accepted_at": o.accepted_at.isoformat() if getattr(o, "accepted_at", None) else None,
         "created_at": o.created_at.isoformat(),
         "updated_at": o.updated_at.isoformat(),
     }
@@ -376,11 +381,15 @@ def update_order(order_id: int, payload: dict, user=Depends(get_current_user), d
     o = db.get(Order, order_id)
     if not o:
         raise HTTPException(404, "Заявка не найдена")
+    old_status = o.status
     if "status" in payload:
         status = str(payload["status"])
         if status not in ORDER_STATUSES:
             raise HTTPException(400, "Неизвестный статус")
         o.status = status
+        if status == "accepted" and old_status != "accepted":
+            o.accepted_by = user.id
+            o.accepted_at = datetime.utcnow()
         if status == "skipped":
             db.execute(delete(OrderItem).where(OrderItem.order_id == o.id))
     if "comment" in payload:
@@ -397,7 +406,17 @@ def update_order(order_id: int, payload: dict, user=Depends(get_current_user), d
             db.add(OrderItem(order_id=o.id, product_id=item.product_id, quantity=item.quantity, note=None))
     db.commit()
     db.refresh(o)
-    return _order_dict(db, o)
+    delivery = None
+    if old_status != "accepted" and o.status == "accepted":
+        try:
+            delivery = send_order_accepted(db, o.id)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            delivery = {"status": "error", "error": str(exc)}
+    result = _order_dict(db, o)
+    result["telegram_delivery"] = delivery
+    return result
 
 
 @router.delete("/{order_id}")

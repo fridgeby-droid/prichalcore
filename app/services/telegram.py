@@ -25,6 +25,14 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     return _post("sendMessage", payload)
 
 
+
+def send_photo(chat_id: int, file_id: str, caption: str | None = None):
+    payload = {"chat_id": chat_id, "photo": file_id, "parse_mode": "HTML"}
+    if caption:
+        payload["caption"] = caption
+    return _post("sendPhoto", payload)
+
+
 def set_webhook():
     if not APP_URL:
         raise RuntimeError("APP_URL/DOMAIN is not configured")

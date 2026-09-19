@@ -12,6 +12,7 @@ import httpx
 
 from app.core.security import get_current_user, TASK_CREATOR_ROLES
 from app.db.database import get_db
+from app.services.notifications import notify_task_assignees
 from app.services.telegram import get_file_path, file_download_url, send_message
 from app.db.models import (
     Employee, EmployeeStore, Store, TaskV2, TaskTarget, TaskAssignee,
@@ -233,6 +234,10 @@ def create_task(payload: TaskCreateIn, user=Depends(get_current_user), db: Sessi
         if text:
             db.add(TaskChecklistItem(task_id=t.id, text=text, require_photo=item.require_photo, sort_order=i))
     add_history(db, t.id, user.id, "created", {"employees": len(employee_ids), "stores": len(store_ids)})
+    try:
+        notify_task_assignees(db, t.id, employee_ids)
+    except Exception:
+        pass
     db.commit(); db.refresh(t)
     return task_payload(db, t, True)
 
@@ -285,6 +290,7 @@ def edit_task(task_id:int,payload:dict,user=Depends(get_current_user),db:Session
     if not t: raise HTTPException(404,"Задача не найдена")
     if not (t.created_by==user.id or user.role in {"operations_director","leader","admin"}): raise HTTPException(403,"Нет доступа")
     changed={}
+    newly_assigned=set()
     for key in ("title","description","priority","deadline","require_photo","require_file","require_comment","recurrence","recurrence_until"):
         if key in payload:
             old=getattr(t,key); val=payload[key]
@@ -307,10 +313,16 @@ def edit_task(task_id:int,payload:dict,user=Depends(get_current_user),db:Session
         for eid in desired:
             if eid not in existing:
                 source=db.scalar(select(EmployeeStore.store_id).where(EmployeeStore.employee_id==eid,EmployeeStore.store_id.in_(stores)).limit(1)) if stores else None
-                db.add(TaskAssignee(task_id=t.id,employee_id=eid,source_store_id=source,status="new"))
-            elif existing[eid].status=="cancelled": existing[eid].status="new"
+                db.add(TaskAssignee(task_id=t.id,employee_id=eid,source_store_id=source,status="new")); newly_assigned.add(eid)
+            elif existing[eid].status=="cancelled":
+                existing[eid].status="new"; newly_assigned.add(eid)
         changed["targets"]={"employees":sorted(explicit),"stores":sorted(stores)}
     if changed: add_history(db,t.id,user.id,"edited",changed)
+    if newly_assigned:
+        try:
+            notify_task_assignees(db,t.id,newly_assigned)
+        except Exception:
+            pass
     db.commit();return task_payload(db,t,True)
 
 

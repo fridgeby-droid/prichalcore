@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Employee, KnowledgeAcknowledgement, KnowledgeArticle, TrainingAssignment, TrainingTest
+from app.services.notifications import notify_test_assignment
 
 
 def ensure_article_ack_assignments(db: Session, article_id: int, user_id: int) -> list[int]:
@@ -43,6 +44,10 @@ def _ensure_assignment(db: Session, test: TrainingTest, employee_id: int, source
     )
     db.add(assignment)
     db.flush()
+    try:
+        notify_test_assignment(db, assignment.id)
+    except Exception:
+        pass
     return assignment
 
 

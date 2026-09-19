@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
 from app.db.database import get_db
+from app.services.notifications import notify_schedule_change, notify_schedule_absence
 from app.db.models import (
     Employee,
     EmployeeStore,
@@ -356,6 +357,10 @@ def create_assignment(payload: AssignmentIn, user=Depends(get_current_user), db:
     )
     db.add(a); db.flush()
     log_change(db, action="created", entity_type="assignment", entity_id=a.id, changed_by=user.id, store_id=a.store_id, employee_id=a.employee_id, change_date=a.work_date, new={"shift_type": a.shift_type, "slot": a.slot})
+    try:
+        notify_schedule_change(db, a.employee_id, a.id, "created", a.store_id, a.work_date, a.shift_type)
+    except Exception:
+        pass
     db.commit()
     return {"ok": True, "id": a.id, "slot": slot}
 
@@ -367,6 +372,11 @@ def delete_assignment(assignment_id: int, user=Depends(get_current_user), db: Se
         raise HTTPException(404, "Смена не найдена")
     old = {"shift_type": a.shift_type, "slot": a.slot, "store_id": a.store_id, "employee_id": a.employee_id, "work_date": a.work_date.isoformat()}
     log_change(db, action="deleted", entity_type="assignment", entity_id=a.id, changed_by=user.id, store_id=a.store_id, employee_id=a.employee_id, change_date=a.work_date, old=old)
+    try:
+        if a.employee_id:
+            notify_schedule_change(db, a.employee_id, a.id, "deleted", a.store_id, a.work_date, a.shift_type)
+    except Exception:
+        pass
     db.delete(a); db.commit()
     return {"ok": True}
 
@@ -389,6 +399,11 @@ def create_absence(payload: AbsenceIn, user=Depends(get_current_user), db: Sessi
     )
     db.add(a); db.flush()
     log_change(db, action="created", entity_type="absence", entity_id=a.id, changed_by=user.id, employee_id=a.employee_id, change_date=a.date_from, new={"date_from": a.date_from.isoformat(), "date_to": a.date_to.isoformat(), "status": a.status, "comment": a.comment})
+    try:
+        status_names={"day_off":"Выходной","vacation":"Отпуск","sick":"Больничный","training":"Обучение"}
+        notify_schedule_absence(db, a.employee_id, a.id, status_names.get(a.status,a.status), a.date_from, a.date_to)
+    except Exception:
+        pass
     db.commit()
     return {"ok": True, "id": a.id}
 
@@ -615,6 +630,12 @@ def assign_substitution(substitution_id: int, payload: ReplacementIn, user=Depen
     x.replacement_user_id = None
     x.status = "assigned"
     log_change(db, action="assigned", entity_type="substitution", entity_id=x.id, changed_by=user.id, store_id=x.store_id, employee_id=replacement_employee_id, change_date=x.work_date, new={"replacement_employee_id": replacement_employee_id, "assignment_id": a.id})
+    try:
+        notify_schedule_change(db, replacement_employee_id, x.id, "substitution", x.store_id, x.work_date, x.shift_type)
+        if x.absent_employee_id:
+            notify_schedule_change(db, x.absent_employee_id, x.id, "deleted", x.store_id, x.work_date, x.shift_type)
+    except Exception:
+        pass
     db.commit()
     return {"ok": True, "assignment_id": a.id}
 

@@ -259,6 +259,23 @@ def _postgres_profile_upgrade(engine):
         add_col("employees", "app_theme", "app_theme VARCHAR(16) NOT NULL DEFAULT 'light'")
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employees_primary_store_id ON employees(primary_store_id)"))
 
+
+def _postgres_telegram_upgrade(engine):
+    """Add Telegram delivery audit fields to legacy orders without deleting history."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "orders" not in tables:
+        return
+    with engine.begin() as conn:
+        def add_col(table: str, col: str, ddl: str):
+            cols = {x["name"] for x in inspect(conn).get_columns(table)}
+            if col not in cols:
+                conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {ddl}'))
+        add_col("orders", "accepted_by", "accepted_by INTEGER REFERENCES users(id) ON DELETE SET NULL")
+        add_col("orders", "accepted_at", "accepted_at TIMESTAMP")
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_accepted_by ON orders(accepted_by)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_accepted_at ON orders(accepted_at)"))
+
 def _seed_knowledge_sections():
     from app.db.models import KnowledgeSection
     get_engine()
@@ -278,6 +295,18 @@ def _seed_knowledge_sections():
     finally:
         db.close()
 
+
+
+def _seed_telegram_message_templates():
+    from app.services.message_templates import seed_default_templates
+    get_engine()
+    db = SessionLocal()
+    try:
+        seed_default_templates(db)
+        db.commit()
+    finally:
+        db.close()
+
 def init_db():
     from app.db import models  # noqa: F401
     engine = get_engine()
@@ -288,8 +317,10 @@ def init_db():
         _postgres_handover_upgrade(engine)
         _postgres_inspection_upgrade(engine)
         _postgres_profile_upgrade(engine)
+        _postgres_telegram_upgrade(engine)
     _seed_employees_from_users()
     _seed_knowledge_sections()
+    _seed_telegram_message_templates()
     _backfill_schedule_employee_ids(engine)
     _backfill_handover_employee_ids(engine)
 

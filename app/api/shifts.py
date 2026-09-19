@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
+from app.services.notifications import send_handover_accepted
 
 from app.core.config import APP_TIMEZONE
 from app.core.security import get_current_user, user_store_ids
@@ -544,7 +545,17 @@ def review_report(report_id: int, payload: ReviewIn, user=Depends(get_current_us
         snapshot_json=_snapshot(db, report),
     ))
     db.commit()
-    return _report_detail(db, report)
+    delivery = None
+    if payload.decision in {"accepted", "accepted_with_remarks"}:
+        try:
+            delivery = send_handover_accepted(db, report.id)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            delivery = {"status": "error", "error": str(exc)}
+    result = _report_detail(db, report)
+    result["telegram_delivery"] = delivery
+    return result
 
 
 @router.get("/history")

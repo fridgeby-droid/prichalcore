@@ -31,6 +31,7 @@ from app.db.models import (
     User,
 )
 from app.services.telegram import file_download_url, get_file_path
+from app.services.notifications import notify_knowledge_published
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
@@ -368,6 +369,11 @@ def create_article(payload: ArticleIn, user=Depends(get_current_user), db: Sessi
     )
     db.add(a); db.flush()
     _replace_links(db, a.id, payload.links)
+    if a.status == "published":
+        try:
+            notify_knowledge_published(db, a.id)
+        except Exception:
+            pass
     db.commit(); db.refresh(a)
     return _article_dict(db, a, user=user)
 
@@ -378,6 +384,7 @@ def update_article(article_id: int, payload: dict, user=Depends(get_current_user
     a = db.get(KnowledgeArticle, article_id)
     if not a:
         raise HTTPException(404, "Статья не найдена")
+    old_status = a.status
     content_keys = {"section_id", "title", "summary", "content_html", "tags", "store_id", "position_tags", "required_ack"}
     content_changed = False
     if "section_id" in payload and not db.get(KnowledgeSection, int(payload["section_id"])):
@@ -407,6 +414,11 @@ def update_article(article_id: int, payload: dict, user=Depends(get_current_user
     if "links" in payload:
         _replace_links(db, a.id, payload.get("links") or [])
     a.updated_by = user.id
+    if old_status != "published" and a.status == "published":
+        try:
+            notify_knowledge_published(db, a.id)
+        except Exception:
+            pass
     db.commit(); db.refresh(a)
     return _article_dict(db, a, user=user)
 
