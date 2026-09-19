@@ -99,7 +99,9 @@ def create_session(db: Session, user: User) -> str:
 
 
 def user_store_ids(db: Session, user: User) -> list[int]:
-    if user.role in LEADERSHIP_ROLES:
+    # Legacy compatibility helper. Only the immutable administrator is implicitly
+    # network-wide. Permission-aware endpoints must use app.core.permissions.
+    if (getattr(user, "role_key", None) or user.role) == "admin":
         from app.db.models import Store
         return list(db.scalars(select(Store.id).where(Store.active.is_(True))).all())
     return list(db.scalars(select(UserStore.store_id).where(UserStore.user_id == user.id)).all())
@@ -125,15 +127,18 @@ def get_current_user(authorization: str | None = Header(default=None), db: Sessi
 
 
 def require_roles(*roles: str):
+    # Legacy dependency. Match the authoritative role_key, never base_role.
     def dependency(user: User = Depends(get_current_user)) -> User:
-        if user.role not in set(roles):
+        effective_role = getattr(user, "role_key", None) or user.role
+        if effective_role not in set(roles):
             raise HTTPException(status_code=403, detail="Insufficient permissions")
         return user
     return dependency
 
 
 def assert_store_access(db: Session, user: User, store_id: int):
-    if user.role in LEADERSHIP_ROLES:
+    # Legacy helper; deliberately avoids granting network access from base_role.
+    if (getattr(user, "role_key", None) or user.role) == "admin":
         return
     allowed = db.scalar(select(UserStore).where(UserStore.user_id == user.id, UserStore.store_id == store_id))
     if not allowed:

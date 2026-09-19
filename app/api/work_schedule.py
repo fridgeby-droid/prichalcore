@@ -10,6 +10,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
+from app.core.permissions import require_access, assigned_store_ids as user_assigned_store_ids, current_employee as permission_employee
 from app.db.database import get_db
 from app.services.notifications import notify_schedule_change, notify_schedule_absence
 from app.db.models import (
@@ -247,18 +248,40 @@ def current_employee(db: Session, user: User) -> Employee | None:
     return db.scalar(select(Employee).where(Employee.user_id == user.id))
 
 
+def _scope_store_ids(db: Session,user,key:str)->set[int]:
+    p=require_access(db,user,key,"view")
+    if p["data_scope"]=="network":return set(db.scalars(select(Store.id).where(Store.active.is_(True))).all())
+    return set(user_assigned_store_ids(db,user))
+
+def _assert_store_permission(db,user,key,store_id,minimum="view"):
+    p=require_access(db,user,key,minimum)
+    if p["data_scope"]!="network" and store_id not in set(user_assigned_store_ids(db,user)):raise HTTPException(403,"Нет доступа к магазину")
+
+def _assert_employee_permission(db,user,key,employee_id,minimum="view"):
+    p=require_access(db,user,key,minimum)
+    if p["data_scope"]=="network":return
+    if p["data_scope"]=="own":
+        own=permission_employee(db,user)
+        if own and own.id==employee_id:return
+        raise HTTPException(403,"Доступны только собственные данные")
+    if not (assigned_store_ids(db,employee_id)&set(user_assigned_store_ids(db,user))):raise HTTPException(403,"Сотрудник не относится к вашим магазинам")
+
+
 @router.get("/context")
 def context(year: int, month: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    start, end = month_bounds(year, month)
-    stores = list(db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all())
-    employees = list(db.scalars(select(Employee).where(Employee.active.is_(True)).order_by(Employee.full_name, Employee.id)).all())
+    start,end=month_bounds(year,month);p=require_access(db,user,"schedule.stores","view");store_ids=_scope_store_ids(db,user,"schedule.stores")
+    stores=list(db.scalars(select(Store).where(Store.active.is_(True),Store.id.in_(store_ids or [-1])).order_by(Store.name)).all())
+    eq=select(Employee).where(Employee.active.is_(True))
+    if p["data_scope"]=="own":
+        own=permission_employee(db,user);eq=eq.where(Employee.id==(own.id if own else -1))
+    elif p["data_scope"]=="stores":eq=eq.join(EmployeeStore,EmployeeStore.employee_id==Employee.id).where(EmployeeStore.store_id.in_(store_ids or [-1]))
+    employees=list(db.scalars(eq.order_by(Employee.full_name,Employee.id)).unique().all())
     employee_ids = [e.id for e in employees]
     bindings = list(db.execute(select(EmployeeStore.employee_id, EmployeeStore.store_id).where(EmployeeStore.employee_id.in_(employee_ids or [-1]))).all())
     employee_map = {e.id: e for e in employees}
     store_map = {s.id: s for s in stores}
     assignments = list(db.scalars(select(WorkShiftAssignment).where(
-        WorkShiftAssignment.work_date.between(start, end),
-        WorkShiftAssignment.employee_id.is_not(None),
+        WorkShiftAssignment.work_date.between(start, end),WorkShiftAssignment.employee_id.is_not(None),WorkShiftAssignment.store_id.in_(store_ids or [-1]),
     ).order_by(WorkShiftAssignment.work_date, WorkShiftAssignment.store_id, WorkShiftAssignment.shift_type, WorkShiftAssignment.slot)).all())
     absences = list(db.scalars(select(WorkAbsence).where(
         WorkAbsence.employee_id.is_not(None),
@@ -302,7 +325,7 @@ def context(year: int, month: int, user=Depends(get_current_user), db: Session =
 
 @router.get("/my")
 def my_schedule(year: int, month: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    start, end = month_bounds(year, month)
+    require_access(db,user,"schedule.my","view");start,end=month_bounds(year,month)
     me = current_employee(db, user)
     if not me:
         return {"linked": False, "assignments": [], "absences": []}
@@ -367,9 +390,10 @@ def create_assignment(payload: AssignmentIn, user=Depends(get_current_user), db:
 
 @router.delete("/assignments/{assignment_id}")
 def delete_assignment(assignment_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    a = db.get(WorkShiftAssignment, assignment_id)
-    if not a:
-        raise HTTPException(404, "Смена не найдена")
+    a=db.get(WorkShiftAssignment,assignment_id)
+    if not a:raise HTTPException(404,"Смена не найдена")
+    require_access(db,user,"schedule.edit","edit");_assert_store_permission(db,user,"schedule.edit",a.store_id,"edit")
+    if a.work_date<date.today():require_access(db,user,"schedule.past_edit","edit")
     old = {"shift_type": a.shift_type, "slot": a.slot, "store_id": a.store_id, "employee_id": a.employee_id, "work_date": a.work_date.isoformat()}
     log_change(db, action="deleted", entity_type="assignment", entity_id=a.id, changed_by=user.id, store_id=a.store_id, employee_id=a.employee_id, change_date=a.work_date, old=old)
     try:
@@ -384,6 +408,7 @@ def delete_assignment(assignment_id: int, user=Depends(get_current_user), db: Se
 @router.post("/absences")
 def create_absence(payload: AbsenceIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     employee_id = resolve_employee_id(db, payload.employee_id, payload.user_id)
+    _assert_employee_permission(db,user,"schedule.absences",employee_id,"edit")
     if payload.status not in ABSENCE_STATUSES:
         raise HTTPException(400, "Некорректный статус")
     if payload.date_to < payload.date_from:
@@ -410,9 +435,9 @@ def create_absence(payload: AbsenceIn, user=Depends(get_current_user), db: Sessi
 
 @router.delete("/absences/{absence_id}")
 def delete_absence(absence_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    a = db.get(WorkAbsence, absence_id)
-    if not a:
-        raise HTTPException(404, "Статус не найден")
+    a=db.get(WorkAbsence,absence_id)
+    if not a:raise HTTPException(404,"Статус не найден")
+    _assert_employee_permission(db,user,"schedule.absences",a.employee_id,"edit")
     old = {"date_from": a.date_from.isoformat(), "date_to": a.date_to.isoformat(), "status": a.status, "comment": a.comment}
     log_change(db, action="deleted", entity_type="absence", entity_id=a.id, changed_by=user.id, employee_id=a.employee_id, change_date=a.date_from, old=old)
     db.delete(a); db.commit()
@@ -488,15 +513,17 @@ def scan_errors(db: Session, start: date, end: date, store_id: int | None = None
 
 @router.get("/errors")
 def errors(year: int, month: int, store_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    start, end = month_bounds(year, month)
-    rows = scan_errors(db, start, end, store_id)
+    require_access(db,user,"schedule.errors","view");start,end=month_bounds(year,month);allowed=_scope_store_ids(db,user,"schedule.errors")
+    if store_id is not None:_assert_store_permission(db,user,"schedule.errors",store_id,"view")
+    rows=[x for x in scan_errors(db,start,end,store_id) if x.get("store_id") in allowed]
     return {"count": len(rows), "items": rows}
 
 
 @router.get("/history")
 def history(year: int, month: int, store_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    start, end = month_bounds(year, month)
-    q = select(WorkScheduleChange).where(or_(WorkScheduleChange.change_date.is_(None), WorkScheduleChange.change_date.between(start, end))).order_by(WorkScheduleChange.created_at.desc()).limit(500)
+    require_access(db,user,"schedule.history","view");start,end=month_bounds(year,month);allowed=_scope_store_ids(db,user,"schedule.history")
+    if store_id is not None:_assert_store_permission(db,user,"schedule.history",store_id,"view")
+    q = select(WorkScheduleChange).where(WorkScheduleChange.store_id.in_(allowed or [-1]),or_(WorkScheduleChange.change_date.is_(None), WorkScheduleChange.change_date.between(start, end))).order_by(WorkScheduleChange.created_at.desc()).limit(500)
     if store_id:
         q = q.where(WorkScheduleChange.store_id == store_id)
     changes = list(db.scalars(q).all())
@@ -521,8 +548,8 @@ def history(year: int, month: int, store_id: int | None = None, user=Depends(get
 
 @router.get("/substitutions")
 def list_substitutions(year: int, month: int, status: str | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    start, end = month_bounds(year, month)
-    q = select(WorkSubstitution).where(WorkSubstitution.work_date.between(start, end)).order_by(WorkSubstitution.work_date.desc(), WorkSubstitution.id.desc())
+    require_access(db,user,"schedule.substitutions","view");start,end=month_bounds(year,month);allowed=_scope_store_ids(db,user,"schedule.substitutions")
+    q=select(WorkSubstitution).where(WorkSubstitution.work_date.between(start,end),WorkSubstitution.store_id.in_(allowed or [-1])).order_by(WorkSubstitution.work_date.desc(), WorkSubstitution.id.desc())
     if status:
         q = q.where(WorkSubstitution.status == status)
     rows = list(db.scalars(q).all())
@@ -548,6 +575,7 @@ def list_substitutions(year: int, month: int, status: str | None = None, user=De
 
 @router.post("/substitutions")
 def create_substitution(payload: SubstitutionIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"schedule.substitutions","edit");_assert_store_permission(db,user,"schedule.substitutions",payload.store_id,"edit")
     if payload.shift_type not in SHIFT_CAPACITY:
         raise HTTPException(400, "Некорректная смена")
     if not db.get(Store, payload.store_id):
@@ -571,6 +599,7 @@ def substitution_candidates(substitution_id: int, user=Depends(get_current_user)
     x = db.get(WorkSubstitution, substitution_id)
     if not x:
         raise HTTPException(404, "Подмена не найдена")
+    require_access(db,user,"schedule.substitutions","view");_assert_store_permission(db,user,"schedule.substitutions",x.store_id,"view")
     employees = list(db.scalars(select(Employee).where(Employee.active.is_(True)).order_by(Employee.full_name, Employee.id)).all())
     rows = []
     for e in employees:
@@ -595,6 +624,7 @@ def assign_substitution(substitution_id: int, payload: ReplacementIn, user=Depen
     x = db.get(WorkSubstitution, substitution_id)
     if not x:
         raise HTTPException(404, "Подмена не найдена")
+    require_access(db,user,"schedule.substitutions","edit");_assert_store_permission(db,user,"schedule.substitutions",x.store_id,"edit")
     replacement_employee_id = resolve_employee_id(db, payload.replacement_employee_id, payload.replacement_user_id)
 
     old_assignment = None
@@ -647,6 +677,7 @@ def update_substitution_status(substitution_id: int, payload: StatusIn, user=Dep
     x = db.get(WorkSubstitution, substitution_id)
     if not x:
         raise HTTPException(404, "Подмена не найдена")
+    require_access(db,user,"schedule.substitutions","edit");_assert_store_permission(db,user,"schedule.substitutions",x.store_id,"edit")
     old = x.status
     x.status = payload.status
     log_change(db, action="status_changed", entity_type="substitution", entity_id=x.id, changed_by=user.id, store_id=x.store_id, employee_id=x.replacement_employee_id or x.absent_employee_id, change_date=x.work_date, old={"status": old}, new={"status": x.status})

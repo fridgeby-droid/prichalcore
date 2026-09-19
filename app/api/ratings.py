@@ -4,10 +4,11 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user, user_store_ids
+from app.core.permissions import module_guard
 from app.db.database import get_db
 from app.db.models import Store, PlanFact, Inspection, Violation, Task, ShiftTemplate, ShiftReport, AppSetting
 
-router = APIRouter(prefix="/api/ratings", tags=["ratings"])
+router=APIRouter(prefix="/api/ratings", tags=["ratings"], dependencies=[Depends(module_guard("ratings"))])
 
 DEFAULT_WEIGHTS = {"plan": 0.40, "inspections": 0.20, "violations": 0.15, "tasks": 0.15, "shifts": 0.10}
 

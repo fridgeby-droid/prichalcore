@@ -17,10 +17,11 @@ from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import ALL_ROLES, get_current_user
+from app.core.security import get_current_user
+from app.core.permissions import require_access, require_any_access, has_access, effective_permission, role_key, assigned_store_ids, current_employee
 from app.db.database import get_db
 from app.db.models import (
-    Employee,
+    Employee, EmployeeStore, RoleDefinition,
     KnowledgeAcknowledgement,
     KnowledgeArticle,
     KnowledgeArticleLink,
@@ -56,9 +57,18 @@ ALLOWED_ATTRS = {
 }
 
 
-def _require_editor(user: User):
-    if user.role not in EDITOR_ROLES:
-        raise HTTPException(403, "Редактировать базу знаний могут администратор, руководитель и операционный директор")
+def _valid_role_keys(db: Session) -> set[str]:
+    return set(db.scalars(select(RoleDefinition.key).where(RoleDefinition.active.is_(True))).all())
+
+def _can_manage_articles(db: Session,user) -> bool:
+    return any(has_access(db,user,k) for k in ("knowledge.create","knowledge.edit","knowledge.publish","knowledge.archive"))
+
+def _article_store_allowed(db:Session,user,article:KnowledgeArticle,key:str="knowledge.read") -> bool:
+    if article.store_id is None: return True
+    p=effective_permission(db,user,key)
+    if p["access_level"]=="hidden": return False
+    if p["data_scope"]=="network": return True
+    return article.store_id in assigned_store_ids(db,user)
 
 
 def _sanitize(raw: str | None) -> str:
@@ -103,14 +113,14 @@ def _section_chain(db: Session, section: KnowledgeSection) -> list[KnowledgeSect
 
 
 def _can_access_section(db: Session, user: User, section: KnowledgeSection) -> bool:
-    if user.role in EDITOR_ROLES:
-        return True
+    if not has_access(db,user,"knowledge.read") and not _can_manage_articles(db,user):
+        return False
+    if role_key(user)=="admin": return True
+    rk=role_key(user)
     for node in _section_chain(db, section):
-        if not node.active:
-            return False
-        allowed = _roles(node)
-        if allowed and user.role not in allowed:
-            return False
+        if not node.active and not _can_manage_articles(db,user): return False
+        allowed=_roles(node)
+        if allowed and rk not in allowed: return False
     return True
 
 
@@ -185,12 +195,11 @@ def _article_dict(db: Session, article: KnowledgeArticle, include_content: bool 
 
 
 def _article_visible(db: Session, user: User, article: KnowledgeArticle) -> bool:
-    section = db.get(KnowledgeSection, article.section_id)
-    if not section or not _can_access_section(db, user, section):
-        return False
-    if user.role in EDITOR_ROLES:
-        return True
-    return article.status == "published"
+    section=db.get(KnowledgeSection,article.section_id)
+    if not section or not _can_access_section(db,user,section): return False
+    if not _article_store_allowed(db,user,article,"knowledge.read"): return False
+    if article.status=="published": return has_access(db,user,"knowledge.read") or _can_manage_articles(db,user)
+    return _can_manage_articles(db,user)
 
 
 class SectionIn(BaseModel):
@@ -227,7 +236,9 @@ class MediaPatch(BaseModel):
 @router.get("/sections")
 def list_sections(manage: bool = False, user=Depends(get_current_user), db: Session = Depends(get_db)):
     if manage:
-        _require_editor(user)
+        require_access(db,user,"knowledge.sections")
+    else:
+        require_access(db,user,"knowledge.read")
     rows = list(db.scalars(select(KnowledgeSection).order_by(KnowledgeSection.sort_order, KnowledgeSection.name)).all())
     result = []
     for s in rows:
@@ -253,14 +264,15 @@ def list_sections(manage: bool = False, user=Depends(get_current_user), db: Sess
 
 @router.post("/sections")
 def create_section(payload: SectionIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.sections","edit")
+    if payload.role_access: require_access(db,user,"knowledge.access","edit")
     if payload.parent_id:
         parent = db.get(KnowledgeSection, payload.parent_id)
         if not parent:
             raise HTTPException(400, "Родительский раздел не найден")
         if parent.parent_id:
             raise HTTPException(400, "Поддерживается структура: раздел → подраздел → статья")
-    invalid = set(payload.role_access) - ALL_ROLES
+    invalid = set(payload.role_access) - _valid_role_keys(db)
     if invalid:
         raise HTTPException(400, f"Неизвестные роли: {', '.join(sorted(invalid))}")
     exists = db.scalar(select(KnowledgeSection).where(KnowledgeSection.parent_id == payload.parent_id, KnowledgeSection.name == payload.name.strip()))
@@ -275,7 +287,8 @@ def create_section(payload: SectionIn, user=Depends(get_current_user), db: Sessi
 
 @router.patch("/sections/{section_id}")
 def update_section(section_id: int, payload: dict, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.sections","edit")
+    if "role_access" in payload: require_access(db,user,"knowledge.access","edit")
     s = db.get(KnowledgeSection, section_id)
     if not s:
         raise HTTPException(404, "Раздел не найден")
@@ -284,7 +297,7 @@ def update_section(section_id: int, payload: dict, user=Depends(get_current_user
         if k not in allowed:
             continue
         if k == "role_access":
-            invalid = set(v or []) - ALL_ROLES
+            invalid = set(v or []) - _valid_role_keys(db)
             if invalid:
                 raise HTTPException(400, "Есть неизвестные роли")
         setattr(s, k, v)
@@ -295,7 +308,7 @@ def update_section(section_id: int, payload: dict, user=Depends(get_current_user
 
 @router.delete("/sections/{section_id}")
 def delete_section(section_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.sections","edit")
     s = db.get(KnowledgeSection, section_id)
     if not s:
         raise HTTPException(404, "Раздел не найден")
@@ -312,13 +325,12 @@ def delete_section(section_id: int, user=Depends(get_current_user), db: Session 
 
 @router.get("/articles")
 def list_articles(section_id: int | None = None, status: str | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"knowledge.read") if not _can_manage_articles(db,user) else None
     q = select(KnowledgeArticle).order_by(KnowledgeArticle.updated_at.desc())
     if section_id:
         q = q.where(KnowledgeArticle.section_id == section_id)
-    if status and user.role in EDITOR_ROLES:
-        q = q.where(KnowledgeArticle.status == status)
-    elif user.role not in EDITOR_ROLES:
-        q = q.where(KnowledgeArticle.status == "published")
+    if status and _can_manage_articles(db,user): q=q.where(KnowledgeArticle.status==status)
+    elif not _can_manage_articles(db,user): q=q.where(KnowledgeArticle.status=="published")
     rows = []
     for a in db.scalars(q).all():
         if _article_visible(db, user, a):
@@ -328,6 +340,7 @@ def list_articles(section_id: int | None = None, status: str | None = None, user
 
 @router.get("/articles/{article_id}")
 def get_article(article_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"knowledge.read") if not _can_manage_articles(db,user) else None
     a = db.get(KnowledgeArticle, article_id)
     if not a or not _article_visible(db, user, a):
         raise HTTPException(404, "Статья не найдена или недоступна")
@@ -346,10 +359,14 @@ def _replace_links(db: Session, article_id: int, links: list[dict]):
 
 @router.post("/articles")
 def create_article(payload: ArticleIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.create","edit")
+    if payload.status=="published": require_access(db,user,"knowledge.publish","edit")
+    if payload.required_ack: require_access(db,user,"knowledge.required","edit")
     section = db.get(KnowledgeSection, payload.section_id)
     if not section:
         raise HTTPException(400, "Раздел не найден")
+    if not _can_access_section(db,user,section): raise HTTPException(403,"Нет доступа к разделу")
+    if payload.store_id is not None and effective_permission(db,user,"knowledge.create")["data_scope"]!="network" and payload.store_id not in assigned_store_ids(db,user): raise HTTPException(403,"Нет доступа к магазину")
     if payload.status not in ARTICLE_STATUSES:
         raise HTTPException(400, "Некорректный статус")
     a = KnowledgeArticle(
@@ -380,7 +397,10 @@ def create_article(payload: ArticleIn, user=Depends(get_current_user), db: Sessi
 
 @router.patch("/articles/{article_id}")
 def update_article(article_id: int, payload: dict, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.edit","edit")
+    if payload.get("status")=="published": require_access(db,user,"knowledge.publish","edit")
+    if payload.get("status")=="archived": require_access(db,user,"knowledge.archive","edit")
+    if "required_ack" in payload: require_access(db,user,"knowledge.required","edit")
     a = db.get(KnowledgeArticle, article_id)
     if not a:
         raise HTTPException(404, "Статья не найдена")
@@ -425,7 +445,7 @@ def update_article(article_id: int, payload: dict, user=Depends(get_current_user
 
 @router.delete("/articles/{article_id}")
 def archive_article(article_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.archive","edit")
     a = db.get(KnowledgeArticle, article_id)
     if not a:
         raise HTTPException(404, "Статья не найдена")
@@ -437,6 +457,7 @@ def archive_article(article_id: int, user=Depends(get_current_user), db: Session
 
 @router.get("/search")
 def search_knowledge(q: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"knowledge.read")
     query = q.strip().lower()
     if not query:
         return []
@@ -467,6 +488,7 @@ def search_knowledge(q: str, user=Depends(get_current_user), db: Session = Depen
 
 @router.get("/required")
 def required_for_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"knowledge.read")
     rows = list(db.scalars(select(KnowledgeArticle).where(KnowledgeArticle.status == "published", KnowledgeArticle.required_ack.is_(True)).order_by(KnowledgeArticle.published_at.desc())).all())
     result = []
     for a in rows:
@@ -485,6 +507,7 @@ def required_for_me(user=Depends(get_current_user), db: Session = Depends(get_db
 
 @router.post("/articles/{article_id}/acknowledge")
 def acknowledge(article_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"knowledge.read")
     a = db.get(KnowledgeArticle, article_id)
     if not a or a.status != "published" or not _article_visible(db, user, a):
         raise HTTPException(404, "Статья недоступна")
@@ -512,18 +535,23 @@ def acknowledge(article_id: int, user=Depends(get_current_user), db: Session = D
 
 @router.get("/acknowledgements/control")
 def acknowledgement_control(article_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    p=require_access(db,user,"knowledge.required")
     a = db.get(KnowledgeArticle, article_id)
     if not a:
         raise HTTPException(404, "Статья не найдена")
     section = db.get(KnowledgeSection, a.section_id)
     if not section:
         return []
-    effective_roles = set(ALL_ROLES)
+    effective_roles = _valid_role_keys(db)
     for node in _section_chain(db, section):
         if node.role_access:
             effective_roles &= set(node.role_access)
-    employees = list(db.scalars(select(Employee).where(Employee.active.is_(True)).order_by(Employee.full_name)).all())
+    eq=select(Employee).where(Employee.active.is_(True)).order_by(Employee.full_name)
+    if p["data_scope"]=="own":
+        me=current_employee(db,user); eq=eq.where(Employee.id==(me.id if me else -1))
+    elif p["data_scope"]=="stores":
+        eids=db.scalars(select(EmployeeStore.employee_id).where(EmployeeStore.store_id.in_(assigned_store_ids(db,user) or [-1]))).all(); eq=eq.where(Employee.id.in_(list(eids) or [-1]))
+    employees=list(db.scalars(eq).all())
     result = []
     for e in employees:
         if effective_roles and e.position not in effective_roles:
@@ -548,7 +576,7 @@ def acknowledgement_control(article_id: int, user=Depends(get_current_user), db:
 
 @router.post("/articles/{article_id}/media-request")
 def media_request(article_id: int, payload: MediaRequestIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.edit","edit")
     if payload.kind not in MEDIA_KINDS:
         raise HTTPException(400, "Поддерживаются фото и видео")
     a = db.get(KnowledgeArticle, article_id)
@@ -561,7 +589,7 @@ def media_request(article_id: int, payload: MediaRequestIn, user=Depends(get_cur
 
 @router.patch("/media/{media_id}")
 def update_media(media_id: int, payload: MediaPatch, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.edit","edit")
     m = db.get(KnowledgeMedia, media_id)
     if not m:
         raise HTTPException(404, "Медиа не найдено")
@@ -572,7 +600,7 @@ def update_media(media_id: int, payload: MediaPatch, user=Depends(get_current_us
 
 @router.delete("/media/{media_id}")
 def delete_media(media_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"knowledge.edit","edit")
     m = db.get(KnowledgeMedia, media_id)
     if not m:
         raise HTTPException(404, "Медиа не найдено")
@@ -582,6 +610,7 @@ def delete_media(media_id: int, user=Depends(get_current_user), db: Session = De
 
 @router.get("/media/{media_id}/content")
 def media_content(media_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"knowledge.read") if not _can_manage_articles(db,user) else None
     m = db.get(KnowledgeMedia, media_id)
     if not m:
         raise HTTPException(404, "Медиа не найдено")
@@ -663,7 +692,7 @@ async def import_article(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_editor(user)
+    require_access(db,user,"knowledge.create","edit")
     section = db.get(KnowledgeSection, section_id)
     if not section:
         raise HTTPException(400, "Раздел не найден")
@@ -696,6 +725,7 @@ async def import_article(
 
 @router.get("/related")
 def related_articles(module_key: str, entity_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"knowledge.read")
     q = select(KnowledgeArticleLink).where(KnowledgeArticleLink.module_key == module_key)
     if entity_id is not None:
         q = q.where((KnowledgeArticleLink.entity_id == entity_id) | (KnowledgeArticleLink.entity_id.is_(None)))
@@ -714,6 +744,7 @@ def related_articles(module_key: str, entity_id: int | None = None, user=Depends
 @router.get("/context-search")
 def ai_context_search(q: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
     """Permission-aware knowledge context for the future AI agent."""
+    require_access(db,user,"knowledge.read")
     results = search_knowledge(q=q, user=user, db=db)[:10]
     out = []
     for item in results:

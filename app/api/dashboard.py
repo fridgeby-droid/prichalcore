@@ -8,7 +8,8 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core.security import get_current_user, user_store_ids
+from app.core.security import get_current_user
+from app.core.permissions import effective_permission, has_access, scope_store_ids, assigned_store_ids
 from app.db.database import get_db
 from app.db.models import (
     AppSetting,
@@ -69,24 +70,15 @@ def _employee(db: Session, user):
 
 
 def _perm(db: Session, user, key: str) -> dict[str, str]:
-    if user.role == "admin":
-        return {"access_level":"edit","data_scope":"network"}
-    rk = getattr(user, "role_key", None) or user.role
-    p = db.get(RolePermission, {"role_key":rk, "permission_key":key})
-    if not p:
-        return {"access_level":"hidden","data_scope":"own"}
-    return {"access_level":p.access_level, "data_scope":p.data_scope}
+    return effective_permission(db,user,key)
 
 
 def _allowed(db: Session, user, key: str) -> bool:
-    return _perm(db, user, key)["access_level"] != "hidden"
+    return has_access(db,user,key,"view")
 
 
 def _scope_stores(db: Session, user, key: str) -> list[int]:
-    p = _perm(db, user, key)
-    if p["data_scope"] == "network" or user.role in {"operations_director","leader","admin"}:
-        return list(db.scalars(select(Store.id).where(Store.active.is_(True))).all())
-    return user_store_ids(db, user)
+    return scope_store_ids(db,user,key,own_as_assigned=True)
 
 
 def _default_layout(user, allowed_keys: set[str]):
@@ -99,7 +91,8 @@ def _default_layout(user, allowed_keys: set[str]):
         ("inspections_week","M"),("my_stores","L"),("overdue_tasks","S"),
         ("team_learning","L"),("next_shift","M"),("my_tasks","M"),
     ]
-    src = seller if user.role in {"seller","mentor"} else manager
+    manager_markers={"new_orders","handover_review","schedule_errors","inspections_week","my_stores","team_learning"}
+    src = manager if (allowed_keys & manager_markers) else seller
     return [{"key":k,"size":sz,"order":i} for i,(k,sz) in enumerate(src) if k in allowed_keys]
 
 
@@ -107,9 +100,10 @@ def _visible_required_articles(db: Session, user, employee) -> list[KnowledgeArt
     q = select(KnowledgeArticle).where(KnowledgeArticle.status=="published", KnowledgeArticle.required_ack.is_(True))
     rows = list(db.scalars(q).all())
     result=[]
-    store_ids=set(user_store_ids(db,user))
+    p=effective_permission(db,user,"knowledge.read")
+    store_ids=set(scope_store_ids(db,user,"knowledge.read",own_as_assigned=True))
     for a in rows:
-        if a.store_id and a.store_id not in store_ids and user.role not in {"operations_director","leader","admin"}:
+        if a.store_id and p["data_scope"]!="network" and a.store_id not in store_ids:
             continue
         tags = set(a.position_tags_json or [])
         if tags and employee and employee.position not in tags:
@@ -211,14 +205,13 @@ def _widget_values(db: Session, user) -> dict[str,Any]:
 def dashboard(user=Depends(get_current_user),db:Session=Depends(get_db)):
     # Legacy response kept for existing UI consumers.
     start=datetime.combine(date.today(),datetime.min.time())
-    allowed=user_store_ids(db,user)
+    allowed=scope_store_ids(db,user,"dashboard.my_stores",own_as_assigned=True) if has_access(db,user,"dashboard.my_stores") else assigned_store_ids(db,user)
     def count(model,field):
         q=select(func.count(model.id)).where(field>=start)
-        if user.role not in {"operations_director","leader","admin"} and hasattr(model,"store_id"): q=q.where(model.store_id.in_(allowed or [-1]))
+        if hasattr(model,"store_id"): q=q.where(model.store_id.in_(allowed or [-1]))
         return db.scalar(q) or 0
     stores=[]
-    sq=select(Store).where(Store.active.is_(True))
-    if user.role not in {"operations_director","leader","admin"}:sq=sq.where(Store.id.in_(allowed or [-1]))
+    sq=select(Store).where(Store.active.is_(True),Store.id.in_(allowed or [-1]))
     for s in db.scalars(sq.order_by(Store.name)).all(): stores.append({"id":s.id,"name":s.name,"score":0,"components":{}})
     return {"today":{"orders":count(Order,Order.created_at),"shifts":db.scalar(select(func.count(ShiftReport.id)).where(ShiftReport.submitted_at>=start,ShiftReport.status!="draft")) or 0,"inspections":count(Inspection,Inspection.completed_at),"cash":0},"my_overdue_tasks":_widget_values(db,user).get("overdue_tasks",{}).get("count",0),"stores":stores}
 

@@ -10,7 +10,11 @@ from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 import httpx
 
-from app.core.security import get_current_user, TASK_CREATOR_ROLES
+from app.core.security import get_current_user
+from app.core.permissions import (
+    assigned_store_ids, current_employee, effective_permission, has_access, require_access,
+    require_any_access, assert_store_scope,
+)
 from app.db.database import get_db
 from app.services.notifications import notify_task_assignees
 from app.services.telegram import get_file_path, file_download_url, send_message
@@ -29,10 +33,6 @@ RECURRENCES = {"none", "daily", "weekly", "monthly"}
 
 def now():
     return datetime.utcnow()
-
-
-def current_employee(db: Session, user: User) -> Employee | None:
-    return db.scalar(select(Employee).where(Employee.user_id == user.id, Employee.active.is_(True)))
 
 
 def name_user(db: Session, uid: int | None):
@@ -104,13 +104,79 @@ def expand_store_employees(db: Session, store_ids: list[int]) -> set[int]:
     return set(rows)
 
 
-def task_accessible(db: Session, task: TaskV2, user: User) -> bool:
-    if user.role in {"operations_director", "leader", "admin"} or task.created_by == user.id:
+def _employee_store_ids(db: Session, employee_id: int) -> set[int]:
+    return set(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id == employee_id)).all())
+
+
+def _employee_allowed(db: Session, user: User, employee_id: int, permission_key: str, minimum: str = "view") -> bool:
+    p = require_access(db, user, permission_key, minimum)
+    if p["data_scope"] == "network":
         return True
-    emp = current_employee(db, user)
-    if not emp:
-        return False
-    return db.scalar(select(TaskAssignee.id).where(TaskAssignee.task_id == task.id, TaskAssignee.employee_id == emp.id).limit(1)) is not None
+    me = current_employee(db, user)
+    if p["data_scope"] == "own":
+        return bool(me and me.id == employee_id)
+    return bool(_employee_store_ids(db, employee_id) & set(assigned_store_ids(db, user)))
+
+
+def _task_store_ids(db: Session, task_id: int) -> set[int]:
+    ids = set(db.scalars(select(TaskTarget.store_id).where(TaskTarget.task_id == task_id, TaskTarget.store_id.is_not(None))).all())
+    ids.update(db.scalars(select(TaskAssignee.source_store_id).where(TaskAssignee.task_id == task_id, TaskAssignee.source_store_id.is_not(None))).all())
+    if ids:
+        return ids
+    # Explicit employee targets may not carry source_store_id. Their employee-store bindings still define scope.
+    eids = db.scalars(select(TaskAssignee.employee_id).where(TaskAssignee.task_id == task_id)).all()
+    if eids:
+        ids.update(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id.in_(list(eids)))).all())
+    return ids
+
+
+def _task_in_permission_scope(db: Session, task: TaskV2, user: User, permission_key: str, minimum: str = "view") -> bool:
+    p = require_access(db, user, permission_key, minimum)
+    if p["data_scope"] == "network":
+        return True
+    if p["data_scope"] == "own":
+        if task.created_by == user.id:
+            return True
+        me = current_employee(db, user)
+        return bool(me and db.scalar(select(TaskAssignee.id).where(TaskAssignee.task_id == task.id, TaskAssignee.employee_id == me.id).limit(1)))
+    allowed = set(assigned_store_ids(db, user))
+    return bool(_task_store_ids(db, task.id) & allowed)
+
+
+def task_accessible(db: Session, task: TaskV2, user: User) -> bool:
+    if has_access(db, user, "tasks.my"):
+        me = current_employee(db, user)
+        if me and db.scalar(select(TaskAssignee.id).where(TaskAssignee.task_id == task.id, TaskAssignee.employee_id == me.id).limit(1)):
+            return True
+    for key in ("tasks.control", "tasks.history"):
+        if has_access(db, user, key):
+            try:
+                if _task_in_permission_scope(db, task, user, key):
+                    return True
+            except HTTPException:
+                pass
+    return False
+
+
+def _scoped_task_ids(db: Session, user: User, permission_key: str) -> set[int] | None:
+    p = require_access(db, user, permission_key)
+    if p["data_scope"] == "network":
+        return None
+    if p["data_scope"] == "own":
+        ids = set(db.scalars(select(TaskV2.id).where(TaskV2.created_by == user.id)).all())
+        me = current_employee(db, user)
+        if me:
+            ids.update(db.scalars(select(TaskAssignee.task_id).where(TaskAssignee.employee_id == me.id)).all())
+        return ids
+    stores = set(assigned_store_ids(db, user))
+    if not stores:
+        return set()
+    ids = set(db.scalars(select(TaskTarget.task_id).where(TaskTarget.store_id.in_(stores))).all())
+    ids.update(db.scalars(select(TaskAssignee.task_id).where(TaskAssignee.source_store_id.in_(stores))).all())
+    employee_ids = db.scalars(select(EmployeeStore.employee_id).where(EmployeeStore.store_id.in_(stores))).all()
+    if employee_ids:
+        ids.update(db.scalars(select(TaskAssignee.task_id).where(TaskAssignee.employee_id.in_(list(employee_ids)))).all())
+    return ids
 
 
 def assignee_payload(db: Session, a: TaskAssignee):
@@ -180,22 +246,41 @@ def task_payload(db: Session, t: TaskV2, include_detail: bool = False):
 
 @router.get("/meta")
 def meta(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    employees = db.scalars(select(Employee).where(Employee.active.is_(True), Employee.employment_status != "fired").order_by(Employee.full_name)).all()
-    stores = db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all()
+    p = require_any_access(db, user, ["tasks.create", "tasks.control", "tasks.history", "tasks.my"])
+    me = current_employee(db, user)
+    if p["data_scope"] == "network":
+        employees = db.scalars(select(Employee).where(Employee.active.is_(True), Employee.employment_status != "fired").order_by(Employee.full_name)).all()
+        stores = db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all()
+    elif p["data_scope"] == "stores":
+        store_ids = assigned_store_ids(db, user)
+        stores = db.scalars(select(Store).where(Store.active.is_(True), Store.id.in_(store_ids or [-1])).order_by(Store.name)).all()
+        employee_ids = db.scalars(select(EmployeeStore.employee_id).where(EmployeeStore.store_id.in_(store_ids or [-1]))).all()
+        employees = db.scalars(select(Employee).where(Employee.active.is_(True), Employee.employment_status != "fired", Employee.id.in_(list(employee_ids) or [-1])).order_by(Employee.full_name)).all()
+    else:
+        employees = [me] if me else []
+        stores = []
+    creators = []
+    if p["data_scope"] == "network":
+        creators = db.scalars(select(User).where(User.active.is_(True)).order_by(User.full_name, User.id)).all()
+    elif p["data_scope"] == "stores":
+        allowed_employee_ids = [e.id for e in employees if e]
+        creator_user_ids = db.scalars(select(Employee.user_id).where(Employee.id.in_(allowed_employee_ids or [-1]), Employee.user_id.is_not(None))).all()
+        creators = db.scalars(select(User).where(User.id.in_(list(creator_user_ids) or [-1]), User.active.is_(True))).all()
+    else:
+        creators = [user]
     return {
-        "employees": [{"id": e.id, "name": e.full_name, "position": e.position} for e in employees],
+        "employees": [{"id": e.id, "name": e.full_name, "position": e.position} for e in employees if e],
         "stores": [{"id": s.id, "name": s.name} for s in stores],
         "priorities": ["low","medium","high","urgent"],
         "recurrences": ["none","daily","weekly","monthly"],
-        "current_employee_id": current_employee(db,user).id if current_employee(db,user) else None,
-        "creators": [{"id":u.id,"name":u.full_name or u.username or str(u.telegram_id)} for u in db.scalars(select(User).where(User.active.is_(True)).order_by(User.full_name,User.id)).all()],
+        "current_employee_id": me.id if me else None,
+        "creators": [{"id":u.id,"name":u.full_name or u.username or str(u.telegram_id)} for u in creators],
     }
 
 
 @router.post("")
 def create_task(payload: TaskCreateIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    if user.role not in TASK_CREATOR_ROLES:
-        raise HTTPException(403, "Только управляющий, ОД и руководитель могут ставить задачи")
+    require_access(db, user, "tasks.create", "edit")
     title = payload.title.strip()
     if not title:
         raise HTTPException(400, "Укажите название задачи")
@@ -203,8 +288,19 @@ def create_task(payload: TaskCreateIn, user=Depends(get_current_user), db: Sessi
         raise HTTPException(400, "Неизвестный приоритет")
     if payload.recurrence not in RECURRENCES:
         raise HTTPException(400, "Неизвестная повторяемость")
-    employee_ids = set(payload.employee_ids)
+    explicit_employee_ids = set(payload.employee_ids)
     store_ids = set(payload.store_ids)
+    if store_ids:
+        require_access(db, user, "tasks.assign_store", "edit")
+        for sid in store_ids:
+            assert_store_scope(db, user, "tasks.assign_store", sid, minimum="edit", own_as_assigned=True)
+    if explicit_employee_ids:
+        assign_key = "tasks.assign_one" if len(explicit_employee_ids) == 1 else "tasks.assign_many"
+        require_access(db, user, assign_key, "edit")
+        for eid in explicit_employee_ids:
+            if not _employee_allowed(db, user, eid, assign_key, "edit"):
+                raise HTTPException(403, "Нет доступа к сотруднику")
+    employee_ids = set(explicit_employee_ids)
     employee_ids |= expand_store_employees(db, list(store_ids))
     if not employee_ids:
         raise HTTPException(400, "Выберите хотя бы одного сотрудника или магазин")
@@ -222,7 +318,7 @@ def create_task(payload: TaskCreateIn, user=Depends(get_current_user), db: Sessi
         recurrence=payload.recurrence, recurrence_until=payload.recurrence_until, created_by=user.id,
     )
     db.add(t); db.flush()
-    for eid in sorted(set(payload.employee_ids)):
+    for eid in sorted(explicit_employee_ids):
         db.add(TaskTarget(task_id=t.id, target_type="employee", employee_id=eid))
     for sid in sorted(store_ids):
         db.add(TaskTarget(task_id=t.id, target_type="store", store_id=sid))
@@ -252,24 +348,24 @@ def list_tasks(
     emp = current_employee(db, user)
     q = select(TaskV2).where(TaskV2.cancelled.is_(False))
     if scope == "my":
+        require_access(db, user, "tasks.my")
         if not emp:
             return []
         q = q.join(TaskAssignee, TaskAssignee.task_id == TaskV2.id).where(TaskAssignee.employee_id == emp.id)
         if status:
             q = q.where(TaskAssignee.status == status)
     elif scope == "control":
-        if user.role in {"operations_director","leader","admin"}:
-            pass
-        else:
-            q = q.where(TaskV2.created_by == user.id)
+        require_access(db, user, "tasks.control")
+        allowed_ids = _scoped_task_ids(db, user, "tasks.control")
+        if allowed_ids is not None:
+            q = q.where(TaskV2.id.in_(list(allowed_ids) or [-1]))
         if status:
             q = q.join(TaskAssignee, TaskAssignee.task_id == TaskV2.id).where(TaskAssignee.status == status)
     elif scope == "history":
-        if user.role not in {"operations_director","leader","admin"}:
-            if emp:
-                q = q.outerjoin(TaskAssignee, TaskAssignee.task_id == TaskV2.id).where(or_(TaskV2.created_by == user.id, TaskAssignee.employee_id == emp.id))
-            else:
-                q = q.where(TaskV2.created_by == user.id)
+        require_access(db, user, "tasks.history")
+        allowed_ids = _scoped_task_ids(db, user, "tasks.history")
+        if allowed_ids is not None:
+            q = q.where(TaskV2.id.in_(list(allowed_ids) or [-1]))
     else:
         raise HTTPException(400, "Неизвестный раздел")
     if priority: q = q.where(TaskV2.priority == priority)
@@ -277,8 +373,17 @@ def list_tasks(
     if deadline_from: q = q.where(TaskV2.deadline >= deadline_from)
     if deadline_to: q = q.where(TaskV2.deadline <= deadline_to)
     if employee_id:
+        if scope == "my" and (not emp or employee_id != emp.id):
+            raise HTTPException(403, "Доступны только собственные задачи")
+        if scope != "my":
+            key = "tasks.control" if scope == "control" else "tasks.history"
+            if not _employee_allowed(db, user, employee_id, key):
+                raise HTTPException(403, "Нет доступа к сотруднику")
         q = q.join(TaskAssignee, TaskAssignee.task_id == TaskV2.id).where(TaskAssignee.employee_id == employee_id)
     if store_id:
+        key = "tasks.control" if scope == "control" else ("tasks.history" if scope == "history" else "tasks.my")
+        if scope != "my":
+            assert_store_scope(db, user, key, store_id)
         q = q.join(TaskTarget, TaskTarget.task_id == TaskV2.id).where(TaskTarget.store_id == store_id)
     q = q.distinct().order_by(TaskV2.deadline.asc().nullslast(), TaskV2.created_at.desc()).limit(500)
     return [task_payload(db, t, False) for t in db.scalars(q).unique().all()]
@@ -288,7 +393,11 @@ def list_tasks(
 def edit_task(task_id:int,payload:dict,user=Depends(get_current_user),db:Session=Depends(get_db)):
     t=db.get(TaskV2,task_id)
     if not t: raise HTTPException(404,"Задача не найдена")
-    if not (t.created_by==user.id or user.role in {"operations_director","leader","admin"}): raise HTTPException(403,"Нет доступа")
+    require_access(db, user, "tasks.edit_before_start", "edit")
+    if not _task_in_permission_scope(db, t, user, "tasks.edit_before_start", "edit"):
+        raise HTTPException(403,"Нет доступа")
+    if any(a.status not in {"new", "cancelled"} for a in db.scalars(select(TaskAssignee).where(TaskAssignee.task_id==t.id)).all()):
+        raise HTTPException(400,"Задачу нельзя редактировать после начала выполнения")
     changed={}
     newly_assigned=set()
     for key in ("title","description","priority","deadline","require_photo","require_file","require_comment","recurrence","recurrence_until"):
@@ -301,6 +410,14 @@ def edit_task(task_id:int,payload:dict,user=Depends(get_current_user),db:Session
     if "employee_ids" in payload or "store_ids" in payload:
         explicit=set(int(x) for x in payload.get("employee_ids",[]))
         stores=set(int(x) for x in payload.get("store_ids",[]))
+        if stores:
+            require_access(db,user,"tasks.assign_store","edit")
+            for sid in stores: assert_store_scope(db,user,"tasks.assign_store",sid,minimum="edit",own_as_assigned=True)
+        if explicit:
+            assign_key="tasks.assign_one" if len(explicit)==1 else "tasks.assign_many"
+            require_access(db,user,assign_key,"edit")
+            for eid in explicit:
+                if not _employee_allowed(db,user,eid,assign_key,"edit"): raise HTTPException(403,"Нет доступа к сотруднику")
         desired=explicit|expand_store_employees(db,list(stores))
         if not desired: raise HTTPException(400,"Должен остаться хотя бы один исполнитель")
         old_targets=db.scalars(select(TaskTarget).where(TaskTarget.task_id==t.id)).all()
@@ -331,7 +448,18 @@ def get_task(task_id: int, user=Depends(get_current_user), db: Session = Depends
     t = db.get(TaskV2, task_id)
     if not t or not task_accessible(db, t, user):
         raise HTTPException(404, "Задача не найдена")
-    return task_payload(db, t, True)
+    payload = task_payload(db, t, True)
+    # Own-only viewers must not see other employees' execution details.
+    can_control = has_access(db,user,"tasks.control") and _task_in_permission_scope(db,t,user,"tasks.control")
+    can_history = has_access(db,user,"tasks.history") and _task_in_permission_scope(db,t,user,"tasks.history")
+    if not (can_control or can_history):
+        me=current_employee(db,user)
+        own_assignees=[a for a in payload.get("assignees",[]) if me and a.get("employee_id")==me.id]
+        own_ids={a["id"] for a in own_assignees}
+        payload["assignees"]=own_assignees
+        payload["comments"]=[c for c in payload.get("comments",[]) if c.get("assignee_id") is None or c.get("assignee_id") in own_ids]
+        payload["history"]=[h for h in payload.get("history",[]) if h.get("assignee_id") is None or h.get("assignee_id") in own_ids]
+    return payload
 
 
 @router.patch("/{task_id}/assignees/{assignee_id}/status")
@@ -340,11 +468,12 @@ def change_assignee_status(task_id: int, assignee_id: int, payload: dict, user=D
     if not t or not a or a.task_id != t.id: raise HTTPException(404, "Исполнение задачи не найдено")
     emp = current_employee(db, user)
     is_assignee = bool(emp and a.employee_id == emp.id)
-    can_review = t.created_by == user.id or user.role in {"operations_director","leader","admin"}
     new_status = str(payload.get("status", ""))
     if new_status not in STATUSES: raise HTTPException(400, "Неизвестный статус")
-    if is_assignee and new_status not in {"in_progress","review"}: raise HTTPException(403, "Исполнитель может только начать задачу или отправить её на проверку")
-    if not is_assignee and not can_review: raise HTTPException(403, "Нет доступа")
+    if not is_assignee:
+        raise HTTPException(403, "Статус выполнения меняет исполнитель; решение принимает постановщик через проверку")
+    require_access(db,user,"tasks.my","edit")
+    if new_status not in {"in_progress","review"}: raise HTTPException(403, "Исполнитель может только начать задачу или отправить её на проверку")
     if new_status == "review":
         if t.require_photo and not db.scalar(select(TaskAttachment.id).where(TaskAttachment.assignee_id == a.id, TaskAttachment.kind == "photo").limit(1)):
             raise HTTPException(400, "Требуется приложить фото")
@@ -407,9 +536,11 @@ def maybe_create_next_recurrence(db: Session, t: TaskV2, user_id: int):
 def review(task_id: int, assignee_id: int, payload: ReviewIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     t = db.get(TaskV2, task_id); a = db.get(TaskAssignee, assignee_id)
     if not t or not a or a.task_id != t.id: raise HTTPException(404, "Исполнение задачи не найдено")
-    if not (t.created_by == user.id or user.role in {"operations_director","leader","admin"}): raise HTTPException(403,"Нет доступа")
-    if a.status != "review": raise HTTPException(400,"Задача ещё не отправлена на проверку")
     if payload.decision not in {"done","rejected"}: raise HTTPException(400,"Решение должно быть done/rejected")
+    permission_key = "tasks.accept" if payload.decision == "done" else "tasks.reject"
+    require_access(db,user,permission_key,"edit")
+    if not _task_in_permission_scope(db,t,user,permission_key,"edit"): raise HTTPException(403,"Нет доступа")
+    if a.status != "review": raise HTTPException(400,"Задача ещё не отправлена на проверку")
     if payload.decision == "rejected" and not (payload.comment or "").strip(): raise HTTPException(400,"При возврате укажите замечание")
     a.status = payload.decision
     a.review_comment = (payload.comment or "").strip() or None
@@ -425,6 +556,7 @@ def review(task_id: int, assignee_id: int, payload: ReviewIn, user=Depends(get_c
 def checklist(task_id:int, assignee_id:int, item_id:int, payload:dict, user=Depends(get_current_user), db:Session=Depends(get_db)):
     t=db.get(TaskV2,task_id); a=db.get(TaskAssignee,assignee_id); item=db.get(TaskChecklistItem,item_id)
     if not t or not a or not item or a.task_id!=t.id or item.task_id!=t.id: raise HTTPException(404,"Пункт не найден")
+    require_access(db,user,"tasks.my","edit")
     emp=current_employee(db,user)
     if not emp or a.employee_id!=emp.id: raise HTTPException(403,"Только исполнитель может отмечать чек-лист")
     p=db.scalar(select(TaskChecklistProgress).where(TaskChecklistProgress.assignee_id==a.id,TaskChecklistProgress.checklist_item_id==item.id))
@@ -441,6 +573,11 @@ def checklist(task_id:int, assignee_id:int, item_id:int, payload:dict, user=Depe
 def comment(task_id:int,payload:CommentIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
     t=db.get(TaskV2,task_id)
     if not t or not task_accessible(db,t,user):raise HTTPException(404,"Задача не найдена")
+    me=current_employee(db,user)
+    own_assignee=bool(me and db.scalar(select(TaskAssignee.id).where(TaskAssignee.task_id==t.id,TaskAssignee.employee_id==me.id).limit(1)))
+    controller=has_access(db,user,"tasks.control","edit") and _task_in_permission_scope(db,t,user,"tasks.control","edit")
+    if own_assignee: require_access(db,user,"tasks.my","edit")
+    elif not controller: raise HTTPException(403,"Нет права комментировать задачу")
     text=payload.text.strip()
     if not text:raise HTTPException(400,"Введите комментарий")
     db.add(TaskComment(task_id=t.id,assignee_id=payload.assignee_id,user_id=user.id,text=text,kind="comment"))
@@ -452,6 +589,7 @@ def comment(task_id:int,payload:CommentIn,user=Depends(get_current_user),db:Sess
 def attachment_request(task_id:int,payload:AttachmentRequestIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
     t=db.get(TaskV2,task_id);a=db.get(TaskAssignee,payload.assignee_id)
     if not t or not a or a.task_id!=t.id:raise HTTPException(404,"Задача не найдена")
+    require_access(db,user,"tasks.my","edit")
     emp=current_employee(db,user)
     if not emp or a.employee_id!=emp.id:raise HTTPException(403,"Прикреплять результат может исполнитель")
     if payload.kind not in {"photo","file"}:raise HTTPException(400,"kind: photo/file")
@@ -488,7 +626,8 @@ def attachment_content(task_id:int,attachment_id:int,user=Depends(get_current_us
 def cancel(task_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
     t=db.get(TaskV2,task_id)
     if not t:raise HTTPException(404,"Задача не найдена")
-    if not (t.created_by==user.id or user.role in {"operations_director","leader","admin"}):raise HTTPException(403,"Нет доступа")
+    require_access(db,user,"tasks.cancel","edit")
+    if not _task_in_permission_scope(db,t,user,"tasks.cancel","edit"):raise HTTPException(403,"Нет доступа")
     t.cancelled=True
     for a in db.scalars(select(TaskAssignee).where(TaskAssignee.task_id==t.id)).all():a.status="cancelled"
     add_history(db,t.id,user.id,"cancelled",{})

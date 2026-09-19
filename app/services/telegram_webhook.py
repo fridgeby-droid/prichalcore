@@ -2,6 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import select
 from app.db.database import session_scope
+from app.core.permissions import has_access
 from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee,KnowledgeMediaUploadRequest,KnowledgeMedia,TrainingQuestionMediaRequest,TrainingQuestion,TelegramDestination
 from app.services.telegram import send_message,miniapp_keyboard
 
@@ -15,8 +16,8 @@ def handle_update(update:dict):
     if text.split("@")[0]=="/register" and chat.get("type") in {"group","supergroup","channel"}:
         with session_scope() as db:
             user=db.scalar(select(User).where(User.telegram_id==tid,User.active.is_(True)))
-            if not user or user.role not in {"manager","operations_director","leader","admin"}:
-                send_message(int(chat["id"]),"⛔ Зарегистрировать группу может управляющий, ОД, руководитель или администратор Причал Core.")
+            if not user or not has_access(db,user,"telegram.groups","edit"):
+                send_message(int(chat["id"]),"⛔ У вас нет права регистрировать Telegram-группы в Причал Core.")
                 return
             dest=db.scalar(select(TelegramDestination).where(TelegramDestination.chat_id==int(chat["id"])))
             title=chat.get("title") or chat.get("username") or f"Telegram {chat['id']}"

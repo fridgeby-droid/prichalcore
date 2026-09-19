@@ -4,11 +4,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.core.security import get_current_user,MANAGEMENT_ROLES,assert_store_access,user_store_ids
+from app.core.permissions import module_guard
 from app.core.serializers import row
 from app.db.database import get_db
 from app.db.models import PlanFact
 
-router=APIRouter(prefix="/api/plans",tags=["plans"])
+router=APIRouter(prefix="/api/plans",tags=["plans"], dependencies=[Depends(module_guard("plans"))])
 
 class PlanIn(BaseModel):
     store_id:int

@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 from app.services.notifications import send_handover_accepted
 
 from app.core.config import APP_TIMEZONE
-from app.core.security import get_current_user, user_store_ids
+from app.core.security import get_current_user
+from app.core.permissions import require_access, assigned_store_ids
 from app.db.database import get_db
 from app.db.models import (
     Employee,
@@ -60,21 +61,17 @@ def _linked_employee(db: Session, user: User) -> Employee | None:
     return db.scalar(select(Employee).where(Employee.user_id == user.id, Employee.active.is_(True)))
 
 
-def _scope_store_ids(db: Session, user: User) -> list[int]:
-    ids = set(user_store_ids(db, user))
-    employee = _linked_employee(db, user)
-    if employee:
-        ids.update(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id == employee.id)).all())
-    return sorted(ids)
+def _scope_store_ids(db: Session, user: User, permission_key: str, own_as_assigned: bool=False) -> list[int]:
+    p=require_access(db,user,permission_key,"view")
+    if p["data_scope"]=="network":return list(db.scalars(select(Store.id).where(Store.active.is_(True))).all())
+    if p["data_scope"]=="stores" or own_as_assigned:return assigned_store_ids(db,user)
+    return []
 
-
-def _can_access_store(db: Session, user: User, store_id: int) -> bool:
-    return store_id in _scope_store_ids(db, user)
-
-
-def _assert_store(db: Session, user: User, store_id: int):
-    if not _can_access_store(db, user, store_id):
-        raise HTTPException(403, "Нет доступа к магазину")
+def _assert_store(db:Session,user:User,store_id:int,permission_key:str,minimum:str="view",own_as_assigned:bool=False):
+    p=require_access(db,user,permission_key,minimum)
+    if p["data_scope"]=="network":return
+    if (p["data_scope"]=="stores" or own_as_assigned) and store_id in assigned_store_ids(db,user):return
+    raise HTTPException(403,"Нет доступа к магазину")
 
 
 def _kind_aliases(shift_type: str) -> list[str]:
@@ -279,6 +276,7 @@ def mine(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    require_access(db,user,"shifts.submit","view")
     employee = _linked_employee(db, user)
     if not employee:
         return {"employee": None, "items": []}
@@ -315,6 +313,7 @@ def mine(
 
 @router.post("/drafts")
 def create_or_open_draft(payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"shifts.submit","edit")
     assignment_id = int(payload.get("assignment_id") or 0)
     assignment = db.get(WorkShiftAssignment, assignment_id)
     if not assignment:
@@ -360,13 +359,16 @@ def report_detail(report_id: int, user=Depends(get_current_user), db: Session = 
     report = db.get(ShiftReport, report_id)
     if not report:
         raise HTTPException(404, "Пересменка не найдена")
-    if report.submitted_by != user.id:
-        _assert_store(db, user, report.store_id)
+    if report.submitted_by == user.id:
+        require_access(db,user,"shifts.history","view")
+    else:
+        _assert_store(db,user,report.store_id,"shifts.control","view")
     return _report_detail(db, report)
 
 
 @router.patch("/reports/{report_id}/draft")
 def save_draft(report_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"shifts.submit","edit")
     report = db.get(ShiftReport, report_id)
     if not report:
         raise HTTPException(404, "Пересменка не найдена")
@@ -388,6 +390,7 @@ def save_draft(report_id: int, payload: dict[str, Any], user=Depends(get_current
 
 @router.post("/reports/{report_id}/submit")
 def submit_report(report_id: int, payload: dict[str, Any] | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"shifts.submit","edit")
     report = db.get(ShiftReport, report_id)
     if not report:
         raise HTTPException(404, "Пересменка не найдена")
@@ -432,10 +435,10 @@ def control(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    target = control_date or _today_local()
-    store_ids = _scope_store_ids(db, user)
+    require_access(db,user,"shifts.control","view")
+    target=control_date or _today_local();store_ids=_scope_store_ids(db,user,"shifts.control")
     if store_id:
-        _assert_store(db, user, store_id)
+        _assert_store(db,user,store_id,"shifts.control","view")
         store_ids = [store_id]
     if not store_ids:
         return {"date": target.isoformat(), "summary": {"total": 0, "review": 0, "accepted": 0, "remarks": 0, "rejected": 0, "missing": 0}, "items": []}
@@ -503,7 +506,8 @@ def review_report(report_id: int, payload: ReviewIn, user=Depends(get_current_us
     report = db.get(ShiftReport, report_id)
     if not report:
         raise HTTPException(404, "Пересменка не найдена")
-    _assert_store(db, user, report.store_id)
+    pk={"accepted":"shifts.accept","accepted_with_remarks":"shifts.accept_remarks","rejected":"shifts.reject"}[payload.decision]
+    _assert_store(db,user,report.store_id,pk,"edit")
     if report.status != "review":
         raise HTTPException(400, "На проверку можно обработать только пересменку со статусом «На проверке»")
     clean_general = (payload.general_comment or "").strip() or None
@@ -567,15 +571,17 @@ def history(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    today = _today_local()
-    start = date_from or today.replace(day=1)
-    end = date_to or today
-    store_ids = _scope_store_ids(db, user)
-    if store_id:
-        _assert_store(db, user, store_id)
-        store_ids = [store_id]
-    if not store_ids:
-        return []
+    p=require_access(db,user,"shifts.history","view");today=_today_local();start=date_from or today.replace(day=1);end=date_to or today
+    if p["data_scope"]=="own":
+        emp=_linked_employee(db,user)
+        if not emp:return []
+        stmt=select(ShiftReport).where(ShiftReport.employee_id==emp.id,ShiftReport.work_date.is_not(None),ShiftReport.work_date>=start,ShiftReport.work_date<=end,ShiftReport.status!="draft")
+        if store_id:stmt=stmt.where(ShiftReport.store_id==store_id)
+        if status:stmt=stmt.where(ShiftReport.status==status)
+        return [_report_brief(db,r) for r in db.scalars(stmt.order_by(ShiftReport.work_date.desc(),ShiftReport.submitted_at.desc())).all()]
+    store_ids=_scope_store_ids(db,user,"shifts.history")
+    if store_id:_assert_store(db,user,store_id,"shifts.history","view");store_ids=[store_id]
+    if not store_ids:return []
     stmt = select(ShiftReport).where(
         ShiftReport.store_id.in_(store_ids),
         ShiftReport.work_date.is_not(None),
@@ -590,9 +596,9 @@ def history(
 
 @router.get("/forms")
 def forms(store_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    store_ids = _scope_store_ids(db, user)
+    require_access(db,user,"shifts.forms","view");store_ids=_scope_store_ids(db,user,"shifts.forms",True)
     if store_id:
-        _assert_store(db, user, store_id)
+        _assert_store(db,user,store_id,"shifts.forms","view",True)
         store_ids = [store_id]
     if not store_ids:
         return []
@@ -658,7 +664,7 @@ def _validate_form(payload: FormIn):
 
 @router.post("/forms")
 def create_form(payload: FormIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _assert_store(db, user, payload.store_id)
+    _assert_store(db,user,payload.store_id,"shifts.forms","edit",True)
     _validate_form(payload)
     if payload.active:
         for old in db.scalars(select(ShiftTemplate).where(
@@ -694,8 +700,8 @@ def update_form(template_id: int, payload: FormIn, user=Depends(get_current_user
     template = db.get(ShiftTemplate, template_id)
     if not template:
         raise HTTPException(404, "Форма не найдена")
-    _assert_store(db, user, template.store_id)
-    _assert_store(db, user, payload.store_id)
+    _assert_store(db,user,template.store_id,"shifts.forms","edit",True)
+    _assert_store(db,user,payload.store_id,"shifts.forms","edit",True)
     _validate_form(payload)
     used = db.scalar(select(ShiftReport.id).where(ShiftReport.template_id == template.id).limit(1))
     if used:
@@ -761,7 +767,7 @@ def delete_form(template_id: int, user=Depends(get_current_user), db: Session = 
     template = db.get(ShiftTemplate, template_id)
     if not template:
         raise HTTPException(404, "Форма не найдена")
-    _assert_store(db, user, template.store_id)
+    _assert_store(db,user,template.store_id,"shifts.forms","edit",True)
     used = db.scalar(select(ShiftReport.id).where(ShiftReport.template_id == template.id).limit(1))
     if used:
         template.active = False

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import APP_TIMEZONE
 from app.core.security import get_current_user
+from app.core.permissions import require_access, assigned_store_ids, assert_store_scope, assert_own_or_scope
 from app.db.database import get_db
 from app.services.notifications import send_order_accepted
 from app.db.models import (
@@ -176,10 +177,13 @@ def _period_bounds(period: str | None, date_value: str | None):
 @router.get("/today-availability")
 def today_availability(user=Depends(get_current_user), db: Session = Depends(get_db)):
     """Показывает, какие заявки по графику должны быть сделаны сегодня по каждой точке."""
+    p = require_access(db, user, "orders.create", "edit")
     now = _local_now()
     weekday = now.weekday()
     start, end = _local_day_bounds(now.date())
-    stores = list(db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all())
+    sq=select(Store).where(Store.active.is_(True))
+    if p["data_scope"]!="network": sq=sq.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
+    stores=list(db.scalars(sq.order_by(Store.name)).all())
     result = []
     for store in stores:
         supplier_ids = _scheduled_supplier_ids(db, store.id, weekday)
@@ -230,6 +234,7 @@ def today_availability(user=Depends(get_current_user), db: Session = Depends(get
 
 @router.get("/available-suppliers")
 def available_suppliers(store_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.create","edit"); assert_store_scope(db,user,"orders.create",store_id,minimum="edit",own_as_assigned=True)
     store = db.get(Store, store_id)
     if not store or not store.active:
         raise HTTPException(404, "Магазин не найден")
@@ -262,6 +267,7 @@ def available_suppliers(store_id: int, user=Depends(get_current_user), db: Sessi
 
 @router.get("/products")
 def available_products(store_id: int, supplier_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.create","edit"); assert_store_scope(db,user,"orders.create",store_id,minimum="edit",own_as_assigned=True)
     mappings = list(db.scalars(select(StoreProduct).where(StoreProduct.store_id == store_id)).all())
     mapped = [x.product_id for x in mappings if x.enabled]
     q = select(Product).where(Product.supplier_id == supplier_id, Product.active.is_(True))
@@ -288,6 +294,7 @@ def available_products(store_id: int, supplier_id: int, user=Depends(get_current
 
 @router.post("")
 def create_order(payload: OrderIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.create","edit"); assert_store_scope(db,user,"orders.create",payload.store_id,minimum="edit",own_as_assigned=True)
     store = db.get(Store, payload.store_id)
     supplier = db.get(Supplier, payload.supplier_id)
     if not store or not store.active:
@@ -335,7 +342,11 @@ def list_orders(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    q = select(Order).order_by(Order.created_at.desc()).limit(500)
+    p=require_access(db,user,"orders.list","view")
+    q=select(Order).order_by(Order.created_at.desc()).limit(500)
+    if p["data_scope"]=="own": q=q.where(Order.created_by==user.id)
+    elif p["data_scope"]=="stores": q=q.where(Order.store_id.in_(assigned_store_ids(db,user) or [-1]))
+    if store_id and p["data_scope"]!="network" and store_id not in assigned_store_ids(db,user): raise HTTPException(403,"Нет доступа к магазину")
     if status:
         q = q.where(Order.status == status)
     if store_id:
@@ -355,6 +366,7 @@ def get_order(order_id: int, user=Depends(get_current_user), db: Session = Depen
     o = db.get(Order, order_id)
     if not o:
         raise HTTPException(404, "Заявка не найдена")
+    assert_own_or_scope(db,user,"orders.list",owner_user_id=o.created_by,store_id=o.store_id,minimum="view")
     return _order_dict(db, o)
 
 
@@ -363,6 +375,7 @@ def share_order_text(order_id: int, user=Depends(get_current_user), db: Session 
     o = db.get(Order, order_id)
     if not o:
         raise HTTPException(404, "Заявка не найдена")
+    assert_own_or_scope(db,user,"orders.list",owner_user_id=o.created_by,store_id=o.store_id,minimum="view")
     data = _order_dict(db, o)
     lines = [f"🏪 {data['store_name']}", f"🚚 {data['supplier_name']}", "", "📦 Заявка:"]
     if data["items"]:
@@ -381,7 +394,12 @@ def update_order(order_id: int, payload: dict, user=Depends(get_current_user), d
     o = db.get(Order, order_id)
     if not o:
         raise HTTPException(404, "Заявка не найдена")
-    old_status = o.status
+    old_status=o.status
+    if "status" in payload:
+        rs=str(payload["status"]); pk="orders.accept" if rs=="accepted" else ("orders.cancel" if rs=="cancelled" else "orders.edit_new")
+        require_access(db,user,pk,"edit"); assert_own_or_scope(db,user,pk,owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
+    if "items" in payload or "comment" in payload:
+        require_access(db,user,"orders.edit_new","edit"); assert_own_or_scope(db,user,"orders.edit_new",owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
     if "status" in payload:
         status = str(payload["status"])
         if status not in ORDER_STATUSES:
@@ -424,6 +442,7 @@ def delete_order(order_id: int, user=Depends(get_current_user), db: Session = De
     o = db.get(Order, order_id)
     if not o:
         raise HTTPException(404, "Заявка не найдена")
+    require_access(db,user,"orders.delete","edit"); assert_own_or_scope(db,user,"orders.delete",owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
     db.delete(o)
     db.commit()
     return {"ok": True}

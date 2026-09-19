@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import APP_URL
+from app.core.permissions import has_access, role_key
 from app.db.models import (
     Employee, EmployeeNotificationPreference, EmployeeStore, KnowledgeArticle,
     KnowledgeSection, Order, OrderItem, Photo, Product, ShiftReport, ShiftReportValue,
@@ -432,16 +433,15 @@ def _employee_can_see_article(db: Session, employee: Employee, article: Knowledg
     section = db.get(KnowledgeSection, article.section_id)
     if not user or not section or not section.active:
         return False
-    editor_roles = {"manager", "operations_director", "leader", "admin"}
-    if user.role not in editor_roles:
-        cur = section
-        seen = set()
+    if not has_access(db,user,"knowledge.read"):
+        return False
+    if role_key(user)!="admin":
+        cur=section; seen=set(); rk=role_key(user)
         while cur and cur.id not in seen:
             seen.add(cur.id)
-            roles = set(cur.role_access or [])
-            if roles and user.role not in roles:
-                return False
-            cur = db.get(KnowledgeSection, cur.parent_id) if cur.parent_id else None
+            roles=set(cur.role_access or [])
+            if roles and rk not in roles: return False
+            cur=db.get(KnowledgeSection,cur.parent_id) if cur.parent_id else None
     if article.store_id:
         store_ids = set(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id == employee.id)).all())
         if article.store_id not in store_ids:

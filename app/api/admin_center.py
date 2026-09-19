@@ -6,14 +6,14 @@ from pydantic import BaseModel
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 from app.core.security import get_current_user
-from app.core.permissions import catalog, all_keys, ACCESS_LEVELS, DATA_SCOPES
+from app.core.permissions import catalog, all_keys, ACCESS_LEVELS, DATA_SCOPES, role_key
 from app.db.database import get_db
 from app.db.models import RoleDefinition, RolePermission, AdminAuditLog, User, UserStore, Store, AppSetting
 
 router=APIRouter(prefix="/api/admin-center",tags=["admin-center"])
 
 def admin_only(user=Depends(get_current_user)):
-    if user.role!="admin": raise HTTPException(403,"Только администратор")
+    if role_key(user)!="admin": raise HTTPException(403,"Только администратор")
     return user
 
 def audit(db,user,action,entity_type,entity_id=None,details=None):
@@ -49,7 +49,7 @@ def create_role(payload:RoleCreate,user=Depends(admin_only),db:Session=Depends(g
     if payload.copy_from:
         src=db.get(RoleDefinition,payload.copy_from)
         if not src: raise HTTPException(404,"Исходная роль не найдена")
-        base=src.base_role
+        base=src.base_role if src.base_role != 'admin' else 'leader'
     r=RoleDefinition(key=key,name=payload.name.strip(),system=False,base_role=base,hidden=False,archived=False);db.add(r);db.flush()
     source={x.permission_key:x for x in db.scalars(select(RolePermission).where(RolePermission.role_key==payload.copy_from)).all()} if payload.copy_from else {}
     for pk in all_keys():

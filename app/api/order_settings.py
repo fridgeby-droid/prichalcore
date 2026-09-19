@@ -16,6 +16,7 @@ from starlette.responses import StreamingResponse
 
 from app.core.config import PHOTO_REQUEST_TTL_MINUTES
 from app.core.security import get_current_user
+from app.core.permissions import require_access, require_any_access, assigned_store_ids, assert_store_scope
 from app.core.serializers import row
 from app.db.database import get_db
 from app.db.models import (
@@ -43,8 +44,9 @@ def _commit_or_conflict(db: Session, message: str = "Объект использ
         raise HTTPException(409, message)
 
 
-# Permissions are intentionally open to every authenticated active user in v1.1.
-# The Roles editor will replace this temporary policy later.
+def _reference_access(db: Session, user):
+    return require_any_access(db,user,("orders.list","orders.create","orders.schedule_view","orders.stores_create","orders.stores_edit","orders.suppliers_create","orders.suppliers_edit","orders.products_create","orders.products_edit","orders.categories_manage","orders.units_manage","orders.limits_manage","orders.prices_manage","orders.import"),"view")
+
 
 
 class StoreIn(BaseModel):
@@ -54,11 +56,14 @@ class StoreIn(BaseModel):
 
 @router.get("/stores")
 def stores(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    return [row(x, "id", "name", "code", "active") for x in db.scalars(select(Store).order_by(Store.name)).all()]
+    p=_reference_access(db,user);q=select(Store)
+    if p["data_scope"]!="network":q=q.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
+    return [row(x,"id","name","code","active") for x in db.scalars(q.order_by(Store.name)).all()]
 
 
 @router.post("/stores")
 def create_store(payload: StoreIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.stores_create","edit")
     obj = Store(name=payload.name.strip(), code=(payload.code or None))
     db.add(obj); _commit_or_conflict(db, "Магазин с таким названием/кодом уже существует"); db.refresh(obj)
     return row(obj, "id", "name", "code", "active")
@@ -66,6 +71,8 @@ def create_store(payload: StoreIn, user=Depends(get_current_user), db: Session =
 
 @router.patch("/stores/{store_id}")
 def update_store(store_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if "active" in payload:require_access(db,user,"orders.stores_disable","edit")
+    if any(k in payload for k in ("name","code")):require_access(db,user,"orders.stores_edit","edit")
     obj = db.get(Store, store_id)
     if not obj: raise HTTPException(404, "Магазин не найден")
     for k in ("name", "code", "active"):
@@ -76,6 +83,7 @@ def update_store(store_id: int, payload: dict[str, Any], user=Depends(get_curren
 
 @router.delete("/stores/{store_id}")
 def delete_store(store_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.stores_delete","edit")
     obj = db.get(Store, store_id)
     if not obj: raise HTTPException(404, "Магазин не найден")
     db.delete(obj); _commit_or_conflict(db, "Магазин уже используется. Отключите его вместо удаления.")
@@ -89,11 +97,13 @@ class SupplierIn(BaseModel):
 
 @router.get("/suppliers")
 def suppliers(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    _reference_access(db,user)
     return [row(x, "id", "name", "deadline_time", "active") for x in db.scalars(select(Supplier).order_by(Supplier.name)).all()]
 
 
 @router.post("/suppliers")
 def create_supplier(payload: SupplierIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.suppliers_create","edit")
     obj = Supplier(name=payload.name.strip(), deadline_time=payload.deadline_time)
     db.add(obj); _commit_or_conflict(db, "Поставщик с таким названием уже существует"); db.refresh(obj)
     return row(obj, "id", "name", "deadline_time", "active")
@@ -101,6 +111,8 @@ def create_supplier(payload: SupplierIn, user=Depends(get_current_user), db: Ses
 
 @router.patch("/suppliers/{supplier_id}")
 def update_supplier(supplier_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if "active" in payload:require_access(db,user,"orders.suppliers_disable","edit")
+    if any(k in payload for k in ("name","deadline_time")):require_access(db,user,"orders.suppliers_edit","edit")
     obj = db.get(Supplier, supplier_id)
     if not obj: raise HTTPException(404, "Поставщик не найден")
     for k in ("name", "deadline_time", "active"):
@@ -111,6 +123,7 @@ def update_supplier(supplier_id: int, payload: dict[str, Any], user=Depends(get_
 
 @router.delete("/suppliers/{supplier_id}")
 def delete_supplier(supplier_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.suppliers_delete","edit")
     obj = db.get(Supplier, supplier_id)
     if not obj: raise HTTPException(404, "Поставщик не найден")
     db.delete(obj); _commit_or_conflict(db, "Поставщик уже используется. Отключите его вместо удаления.")
@@ -124,11 +137,13 @@ class CategoryIn(BaseModel):
 
 @router.get("/categories")
 def categories(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_any_access(db,user,("orders.categories_manage","orders.create","orders.list"),"view")
     return [row(x, "id", "name", "supplier_id", "active") for x in db.scalars(select(Category).order_by(Category.name)).all()]
 
 
 @router.post("/categories")
 def create_category(payload: CategoryIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.categories_manage","edit")
     obj = Category(name=payload.name.strip(), supplier_id=payload.supplier_id)
     db.add(obj); _commit_or_conflict(db, "Такая категория уже существует"); db.refresh(obj)
     return row(obj, "id", "name", "supplier_id", "active")
@@ -136,6 +151,7 @@ def create_category(payload: CategoryIn, user=Depends(get_current_user), db: Ses
 
 @router.patch("/categories/{category_id}")
 def update_category(category_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.categories_manage","edit")
     obj = db.get(Category, category_id)
     if not obj: raise HTTPException(404, "Категория не найдена")
     for k in ("name", "supplier_id", "active"):
@@ -146,6 +162,7 @@ def update_category(category_id: int, payload: dict[str, Any], user=Depends(get_
 
 @router.delete("/categories/{category_id}")
 def delete_category(category_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.categories_manage","edit")
     obj = db.get(Category, category_id)
     if not obj: raise HTTPException(404, "Категория не найдена")
     db.delete(obj); _commit_or_conflict(db, "Категория используется товарами. Отключите её вместо удаления.")
@@ -159,11 +176,13 @@ class UnitIn(BaseModel):
 
 @router.get("/units")
 def units(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_any_access(db,user,("orders.units_manage","orders.create","orders.list"),"view")
     return [row(x, "id", "name", "short_name", "active") for x in db.scalars(select(UnitOfMeasure).order_by(UnitOfMeasure.name)).all()]
 
 
 @router.post("/units")
 def create_unit(payload: UnitIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.units_manage","edit")
     obj = UnitOfMeasure(name=payload.name.strip(), short_name=payload.short_name.strip())
     db.add(obj); _commit_or_conflict(db, "Такая единица измерения уже существует"); db.refresh(obj)
     return row(obj, "id", "name", "short_name", "active")
@@ -171,6 +190,7 @@ def create_unit(payload: UnitIn, user=Depends(get_current_user), db: Session = D
 
 @router.patch("/units/{unit_id}")
 def update_unit(unit_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.units_manage","edit")
     obj = db.get(UnitOfMeasure, unit_id)
     if not obj: raise HTTPException(404, "Единица измерения не найдена")
     for k in ("name", "short_name", "active"):
@@ -181,6 +201,7 @@ def update_unit(unit_id: int, payload: dict[str, Any], user=Depends(get_current_
 
 @router.delete("/units/{unit_id}")
 def delete_unit(unit_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.units_manage","edit")
     obj = db.get(UnitOfMeasure, unit_id)
     if not obj: raise HTTPException(404, "Единица измерения не найдена")
     db.delete(obj); _commit_or_conflict(db)
@@ -196,11 +217,13 @@ class ProductIn(BaseModel):
 
 @router.get("/products")
 def products(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_any_access(db,user,("orders.products_create","orders.products_edit","orders.products_disable","orders.products_delete","orders.import","orders.create","orders.list"),"view")
     return [row(x, "id", "name", "supplier_id", "category_id", "unit", "active") for x in db.scalars(select(Product).order_by(Product.name)).all()]
 
 
 @router.post("/products")
 def create_product(payload: ProductIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.products_create","edit")
     obj = Product(name=payload.name.strip(), supplier_id=payload.supplier_id, category_id=payload.category_id, unit=payload.unit.strip())
     db.add(obj); _commit_or_conflict(db, "Такой товар уже есть у поставщика"); db.refresh(obj)
     return row(obj, "id", "name", "supplier_id", "category_id", "unit", "active")
@@ -208,6 +231,8 @@ def create_product(payload: ProductIn, user=Depends(get_current_user), db: Sessi
 
 @router.patch("/products/{product_id}")
 def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if "active" in payload:require_access(db,user,"orders.products_disable","edit")
+    if any(k in payload for k in ("name","supplier_id","category_id","unit")):require_access(db,user,"orders.products_edit","edit")
     obj = db.get(Product, product_id)
     if not obj: raise HTTPException(404, "Товар не найден")
     for k in ("name", "supplier_id", "category_id", "unit", "active"):
@@ -218,6 +243,7 @@ def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_cu
 
 @router.delete("/products/{product_id}")
 def delete_product(product_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.products_delete","edit")
     obj = db.get(Product, product_id)
     if not obj: raise HTTPException(404, "Товар не найден")
     db.delete(obj); _commit_or_conflict(db, "Товар уже используется в заявках. Отключите его вместо удаления.")
@@ -232,6 +258,8 @@ class AssortmentIn(BaseModel):
 
 @router.get("/assortment")
 def assortment(store_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    p=require_any_access(db,user,("orders.products_edit","orders.create"),"view")
+    if p["data_scope"]!="network" and store_id not in assigned_store_ids(db,user):raise HTTPException(403,"Нет доступа к магазину")
     mappings=list(db.scalars(select(StoreProduct).where(StoreProduct.store_id==store_id)).all())
     enabled={x.product_id for x in mappings if x.enabled}
     explicit=bool(mappings)
@@ -241,6 +269,7 @@ def assortment(store_id:int,user=Depends(get_current_user),db:Session=Depends(ge
 
 @router.put("/assortment")
 def save_assortment(payload:AssortmentIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.products_edit","edit");assert_store_scope(db,user,"orders.products_edit",payload.store_id,minimum="edit",own_as_assigned=True)
     existing=list(db.scalars(select(StoreProduct).where(StoreProduct.store_id==payload.store_id)).all())
     if not existing:
         for pid in db.scalars(select(Product.id).where(Product.active.is_(True))).all():
@@ -264,6 +293,7 @@ class LimitIn(BaseModel):
 
 @router.get("/limits")
 def limits(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.limits_manage","view")
     result=[]
     q=select(ProductOrderLimit, Product, Store).join(Product, Product.id==ProductOrderLimit.product_id).outerjoin(Store, Store.id==ProductOrderLimit.store_id).order_by(Product.name)
     for lim,p,s in db.execute(q).all():
@@ -279,6 +309,8 @@ def limits(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 @router.post("/limits")
 def create_limit(payload: LimitIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.limits_manage","edit")
+    if payload.store_id is not None:assert_store_scope(db,user,"orders.limits_manage",payload.store_id,minimum="edit",own_as_assigned=True)
     q=select(ProductOrderLimit).where(ProductOrderLimit.product_id==payload.product_id, ProductOrderLimit.store_id==payload.store_id)
     obj=db.scalar(q)
     if obj:
@@ -291,6 +323,7 @@ def create_limit(payload: LimitIn, user=Depends(get_current_user), db: Session =
 
 @router.patch("/limits/{limit_id}")
 def update_limit(limit_id:int,payload:dict[str,Any],user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.limits_manage","edit")
     obj=db.get(ProductOrderLimit,limit_id)
     if not obj:raise HTTPException(404,"Лимит не найден")
     for k in ("product_id","store_id","min_qty","max_qty","step_qty","active"):
@@ -301,6 +334,7 @@ def update_limit(limit_id:int,payload:dict[str,Any],user=Depends(get_current_use
 
 @router.delete("/limits/{limit_id}")
 def delete_limit(limit_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.limits_manage","edit")
     obj=db.get(ProductOrderLimit,limit_id)
     if not obj:raise HTTPException(404,"Лимит не найден")
     db.delete(obj);db.commit();return {"ok":True}
@@ -314,14 +348,18 @@ class ScheduleIn(BaseModel):
 
 @router.get("/schedule")
 def schedule(user=Depends(get_current_user),db:Session=Depends(get_db)):
-    stores=[row(x,"id","name","active") for x in db.scalars(select(Store).order_by(Store.name)).all()]
+    p=require_access(db,user,"orders.schedule_view","view");sq=select(Store);rq=select(OrderScheduleRule).where(OrderScheduleRule.active.is_(True),OrderScheduleRule.schedule_type=="order")
+    if p["data_scope"]!="network":
+        ids=assigned_store_ids(db,user);sq=sq.where(Store.id.in_(ids or [-1]));rq=rq.where(OrderScheduleRule.store_id.in_(ids or [-1]))
+    stores=[row(x,"id","name","active") for x in db.scalars(sq.order_by(Store.name)).all()]
     suppliers=[row(x,"id","name","active") for x in db.scalars(select(Supplier).order_by(Supplier.name)).all()]
-    rules=[row(x,"id","store_id","supplier_id","schedule_type","weekday","active") for x in db.scalars(select(OrderScheduleRule).where(OrderScheduleRule.active.is_(True),OrderScheduleRule.schedule_type=="order").order_by(OrderScheduleRule.store_id,OrderScheduleRule.weekday)).all()]
+    rules=[row(x,"id","store_id","supplier_id","schedule_type","weekday","active") for x in db.scalars(rq.order_by(OrderScheduleRule.store_id,OrderScheduleRule.weekday)).all()]
     return {"stores":stores,"suppliers":suppliers,"rules":rules}
 
 
 @router.put("/schedule")
 def save_schedule(payload:ScheduleIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.schedule_edit","edit");assert_store_scope(db,user,"orders.schedule_edit",payload.store_id,minimum="edit",own_as_assigned=True)
     days=sorted({int(x) for x in payload.weekdays if 0<=int(x)<=6})
     db.execute(delete(OrderScheduleRule).where(OrderScheduleRule.store_id==payload.store_id,OrderScheduleRule.supplier_id==payload.supplier_id,OrderScheduleRule.schedule_type=="order"))
     for day in days:
@@ -382,7 +420,8 @@ def _parse_product_rows(filename: str, content: bytes) -> list[dict[str, Any]]:
 
 
 @router.get("/products/import-template")
-def product_import_template(user=Depends(get_current_user)):
+def product_import_template(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.import","view")
     content = "Товар;Поставщик;Категория;Единица\nПример товара;Пример поставщика;Пример категории;шт\n"
     return StreamingResponse(
         iter([content.encode("utf-8-sig")]),
@@ -393,6 +432,7 @@ def product_import_template(user=Depends(get_current_user)):
 
 @router.post("/products/import")
 async def import_products(file: UploadFile = File(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"orders.import","edit")
     content = await file.read()
     if not content:
         raise HTTPException(400, "Файл пуст")
@@ -477,12 +517,14 @@ class PriceListRequestIn(BaseModel):
 
 @router.get("/price-lists")
 def price_lists(user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.prices_manage","view")
     q=select(PriceList,Supplier).join(Supplier,Supplier.id==PriceList.supplier_id).where(PriceList.active.is_(True)).order_by(PriceList.created_at.desc())
     return [{**row(x,"id","supplier_id","title","file_name","mime_type","file_size","created_at"),"supplier_name":s.name} for x,s in db.execute(q).all()]
 
 
 @router.post("/price-lists/request")
 def request_price_list(payload:PriceListRequestIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.prices_manage","edit")
     supplier=db.get(Supplier,payload.supplier_id)
     if not supplier:raise HTTPException(404,"Поставщик не найден")
     for old in db.scalars(select(PriceListUploadRequest).where(PriceListUploadRequest.user_id==user.id,PriceListUploadRequest.status=="waiting")).all():old.status="cancelled"
@@ -494,6 +536,7 @@ def request_price_list(payload:PriceListRequestIn,user=Depends(get_current_user)
 
 @router.delete("/price-lists/{price_list_id}")
 def delete_price_list(price_list_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.prices_manage","edit")
     obj=db.get(PriceList,price_list_id)
     if not obj:raise HTTPException(404,"Прайс-лист не найден")
     db.delete(obj);db.commit();return {"ok":True}
@@ -501,6 +544,7 @@ def delete_price_list(price_list_id:int,user=Depends(get_current_user),db:Sessio
 
 @router.get("/price-lists/{price_list_id}/content")
 def price_list_content(price_list_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.prices_manage","view")
     obj=db.get(PriceList,price_list_id)
     if not obj:raise HTTPException(404,"Прайс-лист не найден")
     path=get_file_path(obj.telegram_file_id)

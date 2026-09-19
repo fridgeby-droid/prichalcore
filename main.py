@@ -31,15 +31,15 @@ async def lifespan(app:FastAPI):
     yield
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.9",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.10",lifespan=lifespan)
 register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.9","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.10","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.9","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.10","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():

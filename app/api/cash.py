@@ -4,11 +4,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.core.security import get_current_user,assert_store_access,MANAGEMENT_ROLES,user_store_ids
+from app.core.permissions import module_guard
 from app.core.serializers import row
 from app.db.database import get_db
 from app.db.models import CashCollection,User
 
-router=APIRouter(prefix="/api/cash",tags=["cash"])
+router=APIRouter(prefix="/api/cash",tags=["cash"], dependencies=[Depends(module_guard("cash"))])
 
 class CashIn(BaseModel):
     store_id:int

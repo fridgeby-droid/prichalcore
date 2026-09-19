@@ -8,9 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
+from app.core.permissions import (require_access, require_any_access, role_key, assigned_store_ids, current_employee, assert_store_scope)
 from app.db.database import get_db
 from app.db.models import (
-    Employee, EmployeeNotificationPreference, Store, Supplier,
+    Employee, EmployeeStore, EmployeeNotificationPreference, Store, Supplier, Order, ShiftReport, OrderScheduleRule,
     TelegramDeliveryLog, TelegramDestination, TelegramRoute, TelegramMessageTemplate,
 )
 from app.services.notifications import (
@@ -24,17 +25,82 @@ from app.services.message_templates import (
 )
 
 router = APIRouter(prefix="/api/telegram-delivery", tags=["telegram-delivery"])
-MANAGE_ROLES = {"manager", "operations_director", "leader", "admin"}
-
-
-def _require_manager(user):
-    if user.role not in MANAGE_ROLES:
-        raise HTTPException(403, "Нет доступа к настройкам Telegram")
-
-
 def _require_admin(user):
-    if user.role != "admin":
-        raise HTTPException(403, "Конструктор шаблонов доступен только администратору")
+    if role_key(user)!="admin": raise HTTPException(403,"Конструктор шаблонов доступен только администратору")
+
+def _employee_allowed(db:Session,user,employee_id:int,key:str,minimum:str="view") -> bool:
+    p=require_access(db,user,key,minimum)
+    if p["data_scope"]=="network": return True
+    me=current_employee(db,user)
+    if p["data_scope"]=="own": return bool(me and me.id==employee_id)
+    stores=set(assigned_store_ids(db,user)); es=set(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id==employee_id)).all())
+    return bool(stores & es)
+
+
+def _supplier_ids_for_stores(db: Session, store_ids: set[int]) -> set[int]:
+    if not store_ids:
+        return set()
+    ids=set(db.scalars(select(OrderScheduleRule.supplier_id).where(OrderScheduleRule.store_id.in_(store_ids))).all())
+    ids.update(db.scalars(select(Order.supplier_id).where(Order.store_id.in_(store_ids))).all())
+    return ids
+
+
+def _route_matches_scope(db: Session, user, route: TelegramRoute, scope: str) -> bool:
+    if scope=="network":
+        return True
+    if scope=="own":
+        return route.created_by == user.id
+    stores=set(assigned_store_ids(db,user))
+    if route.target_type=="store":
+        return route.target_id in stores
+    if route.target_type=="supplier":
+        return route.target_id in _supplier_ids_for_stores(db,stores)
+    return False
+
+
+def _route_allowed(db: Session, user, route: TelegramRoute, key: str="telegram.routes", minimum: str="view") -> bool:
+    p=require_access(db,user,key,minimum)
+    return _route_matches_scope(db,user,route,p["data_scope"])
+
+
+def _assert_route_target_scope(db: Session, user, target_type: str, target_id: int, key: str="telegram.routes", minimum: str="edit"):
+    p=require_access(db,user,key,minimum)
+    if p["data_scope"]=="network":
+        return
+    stores=set(assigned_store_ids(db,user))
+    if target_type=="store" and target_id in stores:
+        return
+    if target_type=="supplier" and target_id in _supplier_ids_for_stores(db,stores):
+        return
+    raise HTTPException(403,"Нет доступа к объекту маршрута")
+
+
+def _destination_allowed(db: Session, user, dest: TelegramDestination, key: str="telegram.groups", minimum: str="view") -> bool:
+    p=require_access(db,user,key,minimum)
+    if p["data_scope"]=="network":
+        return True
+    if dest.registered_by_user_id==user.id:
+        return True
+    routes=list(db.scalars(select(TelegramRoute).where(TelegramRoute.destination_id==dest.id)).all())
+    return any(_route_matches_scope(db,user,r,p["data_scope"]) for r in routes)
+
+
+def _log_allowed(db: Session, user, log: TelegramDeliveryLog, key: str="telegram.logs") -> bool:
+    p=require_access(db,user,key,"view")
+    if p["data_scope"]=="network":
+        return True
+    me=current_employee(db,user)
+    if p["data_scope"]=="own":
+        return bool(me and log.recipient_employee_id==me.id)
+    stores=set(assigned_store_ids(db,user))
+    if log.recipient_employee_id:
+        es=set(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id==log.recipient_employee_id)).all())
+        return bool(stores & es)
+    if log.entity_type=="order":
+        obj=db.get(Order,log.entity_id); return bool(obj and obj.store_id in stores)
+    if log.entity_type=="shift_report":
+        obj=db.get(ShiftReport,log.entity_id); return bool(obj and obj.store_id in stores)
+    return False
 
 
 def _destination_dict(x: TelegramDestination) -> dict[str, Any]:
@@ -65,28 +131,40 @@ def _route_dict(db: Session, x: TelegramRoute) -> dict[str, Any]:
     }
 
 
+def _scoped_supplier_rows(db: Session, user, permission: dict) -> list[dict]:
+    q=select(Supplier).where(Supplier.active.is_(True))
+    if permission["data_scope"]!="network":
+        allowed=_supplier_ids_for_stores(db,set(assigned_store_ids(db,user)))
+        q=q.where(Supplier.id.in_(allowed or {-1}))
+    return [{"id":x.id,"name":x.name} for x in db.scalars(q.order_by(Supplier.name)).all()]
+
+
 @router.get("/meta")
 def meta(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    p=require_any_access(db,user,["telegram.groups","telegram.routes","telegram.logs","telegram.personal"])
+    sq=select(Store).where(Store.active.is_(True)).order_by(Store.name)
+    if p["data_scope"]!="network": sq=sq.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
     return {
         "group_events": GROUP_EVENT_NAMES,
         "personal_events": PERSONAL_EVENT_NAMES,
-        "stores": [{"id": x.id, "name": x.name} for x in db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all()],
-        "suppliers": [{"id": x.id, "name": x.name} for x in db.scalars(select(Supplier).where(Supplier.active.is_(True)).order_by(Supplier.name)).all()],
+        "stores": [{"id": x.id, "name": x.name} for x in db.scalars(sq).all()],
+        "suppliers": _scoped_supplier_rows(db,user,p),
     }
 
 
 @router.get("/destinations")
 def destinations(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
-    return [_destination_dict(x) for x in db.scalars(select(TelegramDestination).order_by(TelegramDestination.active.desc(), TelegramDestination.title)).all()]
+    require_access(db,user,"telegram.groups")
+    rows=db.scalars(select(TelegramDestination).order_by(TelegramDestination.active.desc(), TelegramDestination.title)).all()
+    return [_destination_dict(x) for x in rows if _destination_allowed(db,user,x)]
 
 
 @router.patch("/destinations/{destination_id}")
 def update_destination(destination_id: int, payload: dict, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.groups","edit")
     x = db.get(TelegramDestination, destination_id)
     if not x: raise HTTPException(404, "Telegram-группа не найдена")
+    if not _destination_allowed(db,user,x,"telegram.groups","edit"): raise HTTPException(403,"Нет доступа к Telegram-группе")
     if "title" in payload: x.title = str(payload["title"]).strip() or x.title
     if "active" in payload: x.active = bool(payload["active"])
     db.commit(); db.refresh(x)
@@ -95,9 +173,10 @@ def update_destination(destination_id: int, payload: dict, user=Depends(get_curr
 
 @router.post("/destinations/{destination_id}/test")
 def test_destination(destination_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.groups","edit")
     x = db.get(TelegramDestination, destination_id)
     if not x or not x.active: raise HTTPException(404, "Telegram-группа недоступна")
+    if not _destination_allowed(db,user,x,"telegram.groups","edit"): raise HTTPException(403,"Нет доступа к Telegram-группе")
     try:
         data = send_message(int(x.chat_id), "⚓ <b>Причал Core</b>\nТестовое сообщение. Группа подключена корректно.")
         return {"ok": True, "message_id": (data.get("result") or {}).get("message_id")}
@@ -115,20 +194,25 @@ class RouteIn(BaseModel):
 
 @router.get("/routes")
 def routes(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
-    return [_route_dict(db, x) for x in db.scalars(select(TelegramRoute).order_by(TelegramRoute.event_type, TelegramRoute.target_type, TelegramRoute.target_id)).all()]
+    require_access(db,user,"telegram.routes")
+    rows=db.scalars(select(TelegramRoute).order_by(TelegramRoute.event_type, TelegramRoute.target_type, TelegramRoute.target_id)).all()
+    return [_route_dict(db,x) for x in rows if _route_allowed(db,user,x)]
 
 
 @router.post("/routes")
 def save_route(payload: RouteIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.routes","edit")
     if payload.event_type not in GROUP_EVENT_NAMES:
         raise HTTPException(400, "Неизвестный тип события")
     expected = "supplier" if payload.event_type == "order_accepted" else "store"
     if payload.target_type != expected:
         raise HTTPException(400, f"Для этого события нужен объект типа {expected}")
-    if not db.get(TelegramDestination, payload.destination_id):
+    _assert_route_target_scope(db,user,payload.target_type,payload.target_id,"telegram.routes","edit")
+    destination=db.get(TelegramDestination, payload.destination_id)
+    if not destination:
         raise HTTPException(400, "Telegram-группа не найдена")
+    if not _destination_allowed(db,user,destination,"telegram.groups","view"):
+        raise HTTPException(403,"Нет доступа к Telegram-группе")
     if payload.target_type == "supplier" and not db.get(Supplier, payload.target_id):
         raise HTTPException(400, "Поставщик не найден")
     if payload.target_type == "store" and not db.get(Store, payload.target_id):
@@ -149,20 +233,21 @@ def save_route(payload: RouteIn, user=Depends(get_current_user), db: Session = D
 
 @router.delete("/routes/{route_id}")
 def delete_route(route_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.routes","edit")
     x = db.get(TelegramRoute, route_id)
     if not x: raise HTTPException(404, "Маршрут не найден")
+    if not _route_allowed(db,user,x,"telegram.routes","edit"): raise HTTPException(403,"Нет доступа к маршруту")
     db.delete(x); db.commit()
     return {"ok": True}
 
 
 @router.get("/logs")
 def logs(limit: int = 100, status: str | None = None, event_type: str | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.logs")
     q = select(TelegramDeliveryLog).order_by(TelegramDeliveryLog.created_at.desc()).limit(min(max(limit, 1), 500))
     if status: q = q.where(TelegramDeliveryLog.status == status)
     if event_type: q = q.where(TelegramDeliveryLog.event_type == event_type)
-    rows = db.scalars(q).all()
+    rows = [x for x in db.scalars(q).all() if _log_allowed(db,user,x,"telegram.logs")]
     return [{
         "id": x.id, "event_type": x.event_type,
         "event_name": GROUP_EVENT_NAMES.get(x.event_type) or PERSONAL_EVENT_NAMES.get(x.event_type) or x.event_type,
@@ -175,26 +260,35 @@ def logs(limit: int = 100, status: str | None = None, event_type: str | None = N
 
 @router.get("/entity-status/{entity_type}/{entity_id}")
 def entity_status(entity_type: str, entity_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"telegram.logs")
     q = select(TelegramDeliveryLog).where(TelegramDeliveryLog.entity_type == entity_type, TelegramDeliveryLog.entity_id == entity_id).order_by(TelegramDeliveryLog.created_at.desc())
-    rows = list(db.scalars(q).all())
+    rows = [x for x in db.scalars(q).all() if _log_allowed(db,user,x,"telegram.logs")]
     return [{"event_type":x.event_type,"status":x.status,"sent_at":x.sent_at,"error":x.error,"message_id":x.telegram_message_id} for x in rows[:20]]
 
 
 @router.post("/resend/order/{order_id}")
 def resend_order(order_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"orders.resend","edit")
+    order=db.get(Order,order_id)
+    if not order: raise HTTPException(404,"Заявка не найдена")
+    assert_store_scope(db,user,"orders.resend",order.store_id,minimum="edit",own_as_assigned=True)
     result = send_order_accepted(db, order_id, force=True); db.commit(); return result
 
 
 @router.post("/resend/handover/{report_id}")
 def resend_handover(report_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.routes","edit")
+    require_access(db,user,"shifts.control","edit")
+    report=db.get(ShiftReport,report_id)
+    if not report: raise HTTPException(404,"Пересменка не найдена")
+    assert_store_scope(db,user,"shifts.control",report.store_id,minimum="edit",own_as_assigned=True)
     result = send_handover_accepted(db, report_id, force=True); db.commit(); return result
 
 
 @router.get("/personal-preferences/{employee_id}")
 def get_personal_preferences(employee_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.personal")
+    if not _employee_allowed(db,user,employee_id,"telegram.personal"): raise HTTPException(403,"Нет доступа к сотруднику")
     if not db.get(Employee, employee_id): raise HTTPException(404, "Сотрудник не найден")
     rows = {x.event_type: x.enabled for x in db.scalars(select(EmployeeNotificationPreference).where(EmployeeNotificationPreference.employee_id == employee_id)).all()}
     return {k: rows.get(k, True) for k in PERSONAL_EVENT_NAMES}
@@ -202,7 +296,8 @@ def get_personal_preferences(employee_id: int, user=Depends(get_current_user), d
 
 @router.patch("/personal-preferences/{employee_id}")
 def set_personal_preferences(employee_id: int, payload: dict[str, bool], user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_manager(user)
+    require_access(db,user,"telegram.personal","edit")
+    if not _employee_allowed(db,user,employee_id,"telegram.personal","edit"): raise HTTPException(403,"Нет доступа к сотруднику")
     if not db.get(Employee, employee_id): raise HTTPException(404, "Сотрудник не найден")
     for event_type, enabled in payload.items():
         if event_type not in PERSONAL_EVENT_NAMES: continue

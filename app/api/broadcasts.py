@@ -3,11 +3,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.core.security import get_current_user, MANAGEMENT_ROLES
+from app.core.permissions import module_guard
 from app.core.serializers import row
 from app.db.database import get_db
 from app.db.models import Broadcast
 
-router=APIRouter(prefix="/api/broadcasts",tags=["broadcasts"])
+router=APIRouter(prefix="/api/broadcasts",tags=["broadcasts"], dependencies=[Depends(module_guard("broadcasts"))])
 
 class BroadcastIn(BaseModel):
     title:str

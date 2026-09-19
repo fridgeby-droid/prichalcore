@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.core.security import MANAGEMENT_ROLES, get_current_user
+from app.core.security import get_current_user
+from app.core.permissions import require_access, require_any_access, has_access, effective_permission, assigned_store_ids, current_employee, assert_store_scope, role_key
 from app.db.database import get_db
 from app.db.models import (
     Employee,
@@ -26,24 +27,29 @@ from app.db.models import (
     TrainingQuestionMediaRequest,
     TrainingQuestionOption,
     TrainingTest,
-    User,
+    User, RoleDefinition,
 )
 from app.services.telegram import file_download_url, get_file_path
 from app.services.notifications import notify_test_assignment
 
 router = APIRouter(prefix="/api/testing", tags=["testing"])
-EDITOR_ROLES = set(MANAGEMENT_ROLES)
 TEST_STATUSES = {"draft", "published", "archived"}
 QUESTION_TYPES = {"single", "multiple", "text"}
 
-
-def _require_editor(user: User):
-    if user.role not in EDITOR_ROLES:
-        raise HTTPException(403, "Создавать и управлять тестами могут управляющий, ОД, руководитель и администратор")
-
+def _can_edit_tests(db:Session,user) -> bool:
+    return any(has_access(db,user,k) for k in ("testing.create","testing.questions","testing.publish","testing.assign","testing.control","testing.retry"))
 
 def _current_employee(db: Session, user: User) -> Employee | None:
-    return db.scalar(select(Employee).where(Employee.user_id == user.id, Employee.active.is_(True)))
+    return current_employee(db,user)
+
+def _employee_allowed(db:Session,user,employee_id:int,key:str,minimum:str="view") -> bool:
+    p=require_access(db,user,key,minimum)
+    if p["data_scope"]=="network": return True
+    me=current_employee(db,user)
+    if p["data_scope"]=="own": return bool(me and me.id==employee_id)
+    stores=set(assigned_store_ids(db,user))
+    e_stores=set(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id==employee_id)).all())
+    return bool(stores & e_stores)
 
 
 def _norm_text(value: str | None) -> str:
@@ -297,20 +303,23 @@ class AnswerIn(BaseModel):
 
 @router.get("/meta")
 def meta(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    employees = list(db.scalars(select(Employee).where(Employee.active.is_(True)).order_by(Employee.full_name)).all())
-    stores = list(db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all())
-    articles = list(db.scalars(select(KnowledgeArticle).where(KnowledgeArticle.status == "published").order_by(KnowledgeArticle.title)).all())
-    return {
-        "can_edit": user.role in EDITOR_ROLES,
-        "employees": [{"id": e.id, "full_name": e.full_name, "position": e.position} for e in employees],
-        "stores": [{"id": s.id, "name": s.name} for s in stores],
-        "roles": ["seller", "mentor", "manager", "operations_director", "leader", "admin"],
-        "articles": [{"id": a.id, "title": a.title, "required_ack": a.required_ack} for a in articles],
-    }
+    p=require_any_access(db,user,["testing.take","testing.catalog","testing.create","testing.assign","testing.control","testing.questions"])
+    if p["data_scope"]=="network":
+        employees=list(db.scalars(select(Employee).where(Employee.active.is_(True)).order_by(Employee.full_name)).all())
+        stores=list(db.scalars(select(Store).where(Store.active.is_(True)).order_by(Store.name)).all())
+    elif p["data_scope"]=="stores":
+        sids=assigned_store_ids(db,user); stores=list(db.scalars(select(Store).where(Store.active.is_(True),Store.id.in_(sids or [-1])).order_by(Store.name)).all())
+        eids=db.scalars(select(EmployeeStore.employee_id).where(EmployeeStore.store_id.in_(sids or [-1]))).all(); employees=list(db.scalars(select(Employee).where(Employee.active.is_(True),Employee.id.in_(list(eids) or [-1])).order_by(Employee.full_name)).all())
+    else:
+        me=current_employee(db,user); employees=[me] if me else []; stores=[]
+    articles=list(db.scalars(select(KnowledgeArticle).where(KnowledgeArticle.status=="published").order_by(KnowledgeArticle.title)).all()) if has_access(db,user,"testing.create") else []
+    roles=list(db.scalars(select(RoleDefinition.key).where(RoleDefinition.active.is_(True),RoleDefinition.hidden.is_(False)).order_by(RoleDefinition.name)).all())
+    return {"can_edit":_can_edit_tests(db,user),"employees":[{"id":e.id,"full_name":e.full_name,"position":e.position} for e in employees if e],"stores":[{"id":x.id,"name":x.name} for x in stores],"roles":roles,"articles":[{"id":a.id,"title":a.title,"required_ack":a.required_ack} for a in articles]}
 
 
 @router.get("/active-attempt")
 def active_attempt(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"testing.take")
     employee = _current_employee(db, user)
     if not employee:
         return None
@@ -323,6 +332,7 @@ def active_attempt(user=Depends(get_current_user), db: Session = Depends(get_db)
 
 @router.get("/my")
 def my_tests(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"testing.take")
     employee = _current_employee(db, user)
     if not employee:
         return []
@@ -334,6 +344,7 @@ def my_tests(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 @router.get("/catalog")
 def catalog(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"testing.catalog")
     rows = list(db.scalars(select(TrainingTest).where(TrainingTest.status == "published").order_by(TrainingTest.updated_at.desc())).all())
     employee = _current_employee(db, user)
     assigned = {}
@@ -345,13 +356,14 @@ def catalog(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 @router.get("/tests")
 def tests(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.create","edit")
     return [_test_dict(db, x) for x in db.scalars(select(TrainingTest).order_by(TrainingTest.updated_at.desc())).all()]
 
 
 @router.post("/tests")
 def create_test(payload: TestIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.create","edit")
+    if payload.status=="published": require_access(db,user,"testing.publish","edit")
     if payload.status not in TEST_STATUSES:
         raise HTTPException(400, "Некорректный статус")
     if payload.linked_article_id and not db.get(KnowledgeArticle, payload.linked_article_id):
@@ -369,14 +381,17 @@ def get_test(test_id: int, user=Depends(get_current_user), db: Session = Depends
     test = db.get(TrainingTest, test_id)
     if not test:
         raise HTTPException(404, "Тест не найден")
-    if user.role not in EDITOR_ROLES and test.status != "published":
-        raise HTTPException(404, "Тест недоступен")
-    return _test_dict(db, test, include_questions=user.role in EDITOR_ROLES, include_keys=user.role in EDITOR_ROLES)
+    editor=_can_edit_tests(db,user)
+    if not editor:
+        require_access(db,user,"testing.catalog")
+        if test.status!="published": raise HTTPException(404,"Тест недоступен")
+    return _test_dict(db,test,include_questions=editor,include_keys=editor)
 
 
 @router.patch("/tests/{test_id}")
 def update_test(test_id: int, payload: TestIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.create","edit")
+    if payload.status=="published": require_access(db,user,"testing.publish","edit")
     test = db.get(TrainingTest, test_id)
     if not test:
         raise HTTPException(404, "Тест не найден")
@@ -393,7 +408,7 @@ def update_test(test_id: int, payload: TestIn, user=Depends(get_current_user), d
 
 @router.delete("/tests/{test_id}")
 def archive_test(test_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.create","edit")
     test = db.get(TrainingTest, test_id)
     if not test:
         raise HTTPException(404, "Тест не найден")
@@ -403,7 +418,7 @@ def archive_test(test_id: int, user=Depends(get_current_user), db: Session = Dep
 
 @router.post("/tests/{test_id}/questions")
 def add_question(test_id: int, payload: QuestionIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.questions","edit")
     test = db.get(TrainingTest, test_id)
     if not test:
         raise HTTPException(404, "Тест не найден")
@@ -432,7 +447,7 @@ def _validate_question(payload: QuestionIn):
 
 @router.patch("/questions/{question_id}")
 def update_question(question_id: int, payload: QuestionIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.questions","edit")
     q = db.get(TrainingQuestion, question_id)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
@@ -449,7 +464,7 @@ def update_question(question_id: int, payload: QuestionIn, user=Depends(get_curr
 
 @router.delete("/questions/{question_id}")
 def delete_question(question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.questions","edit")
     q = db.get(TrainingQuestion, question_id)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
@@ -464,7 +479,7 @@ def delete_question(question_id: int, user=Depends(get_current_user), db: Sessio
 
 @router.post("/questions/{question_id}/photo-request")
 def question_photo_request(question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.questions","edit")
     q = db.get(TrainingQuestion, question_id)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
@@ -475,7 +490,7 @@ def question_photo_request(question_id: int, user=Depends(get_current_user), db:
 
 @router.delete("/questions/{question_id}/photo")
 def delete_question_photo(question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.questions","edit")
     q = db.get(TrainingQuestion, question_id)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
@@ -488,7 +503,8 @@ def question_image(question_id: int, user=Depends(get_current_user), db: Session
     q = db.get(TrainingQuestion, question_id)
     if not q or not q.image_telegram_file_id:
         raise HTTPException(404, "Изображение не найдено")
-    if user.role not in EDITOR_ROLES:
+    if not has_access(db,user,"testing.questions"):
+        require_access(db,user,"testing.take")
         employee = _current_employee(db, user)
         active = _active_attempt_for_employee(db, employee.id) if employee else None
         if not active or question_id not in {int(x) for x in (active.question_order_json or [])}:
@@ -505,15 +521,25 @@ def question_image(question_id: int, user=Depends(get_current_user), db: Session
 
 @router.post("/tests/{test_id}/assign")
 def assign_test(test_id: int, payload: AssignmentIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.assign","edit")
     test = db.get(TrainingTest, test_id)
     if not test:
         raise HTTPException(404, "Тест не найден")
-    ids = set(payload.employee_ids)
+    ids=set(payload.employee_ids)
     if payload.roles:
-        ids.update(db.scalars(select(Employee.id).where(Employee.active.is_(True), Employee.position.in_(payload.roles))).all())
+        role_set=set(payload.roles)
+        for e in db.scalars(select(Employee).where(Employee.active.is_(True))).all():
+            linked=db.get(User,e.user_id) if e.user_id else None
+            rk=(getattr(linked,"role_key",None) or linked.role) if linked else e.position
+            if rk in role_set: ids.add(e.id)
     if payload.store_ids:
         ids.update(db.scalars(select(EmployeeStore.employee_id).join(Employee, Employee.id == EmployeeStore.employee_id).where(EmployeeStore.store_id.in_(payload.store_ids), Employee.active.is_(True))).all())
+    p_assign=effective_permission(db,user,"testing.assign")
+    if p_assign["data_scope"]!="network":
+        allowed=[]
+        for eid in ids:
+            if _employee_allowed(db,user,int(eid),"testing.assign","edit"): allowed.append(eid)
+        ids=set(allowed)
     if not ids:
         raise HTTPException(400, "Выберите сотрудников, роль или магазины")
     created = 0; updated = 0; created_assignment_ids = []
@@ -541,8 +567,12 @@ def assign_test(test_id: int, payload: AssignmentIn, user=Depends(get_current_us
 
 @router.get("/control")
 def control(test_id: int | None = None, status: str | None = None, employee_id: int | None = None, store_id: int | None = None, role: str | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    p=require_access(db,user,"testing.control")
     q = select(TrainingAssignment).order_by(TrainingAssignment.updated_at.desc())
+    if p["data_scope"]=="own":
+        me=current_employee(db,user); q=q.where(TrainingAssignment.employee_id==(me.id if me else -1))
+    elif p["data_scope"]=="stores":
+        eids=db.scalars(select(EmployeeStore.employee_id).where(EmployeeStore.store_id.in_(assigned_store_ids(db,user) or [-1]))).all(); q=q.where(TrainingAssignment.employee_id.in_(list(eids) or [-1]))
     if test_id: q = q.where(TrainingAssignment.test_id == test_id)
     if employee_id: q = q.where(TrainingAssignment.employee_id == employee_id)
     if role: q = q.join(Employee, Employee.id == TrainingAssignment.employee_id).where(Employee.position == role)
@@ -560,7 +590,7 @@ def control(test_id: int | None = None, status: str | None = None, employee_id: 
 
 @router.post("/assignments/{assignment_id}/allow-retry")
 def allow_retry(assignment_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_editor(user)
+    require_access(db,user,"testing.retry","edit")
     a = db.get(TrainingAssignment, assignment_id)
     if not a:
         raise HTTPException(404, "Назначение не найдено")
@@ -580,6 +610,7 @@ def allow_retry(assignment_id: int, user=Depends(get_current_user), db: Session 
 
 @router.post("/assignments/{assignment_id}/start")
 def start_attempt(assignment_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"testing.take","edit")
     employee = _current_employee(db, user)
     if not employee:
         raise HTTPException(400, "Telegram-аккаунт не связан с карточкой сотрудника")
@@ -632,14 +663,18 @@ def get_attempt(attempt_id: int, user=Depends(get_current_user), db: Session = D
     attempt = db.get(TrainingAttempt, attempt_id)
     if not attempt:
         raise HTTPException(404, "Попытка не найдена")
-    employee = _current_employee(db, user)
-    if user.role not in EDITOR_ROLES and (not employee or attempt.employee_id != employee.id):
-        raise HTTPException(403, "Нет доступа")
+    employee=_current_employee(db,user)
+    if employee and attempt.employee_id==employee.id:
+        require_access(db,user,"testing.take")
+    else:
+        require_access(db,user,"testing.control")
+        if not _employee_allowed(db,user,attempt.employee_id,"testing.control"): raise HTTPException(403,"Нет доступа")
     return _attempt_payload(db, attempt, include_answers=True)
 
 
 @router.put("/attempts/{attempt_id}/answers/{question_id}")
 def save_answer(attempt_id: int, question_id: int, payload: AnswerIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"testing.take","edit")
     attempt = db.get(TrainingAttempt, attempt_id)
     employee = _current_employee(db, user)
     if not attempt or not employee or attempt.employee_id != employee.id:
@@ -676,6 +711,7 @@ def save_answer(attempt_id: int, question_id: int, payload: AnswerIn, user=Depen
 
 @router.post("/attempts/{attempt_id}/submit")
 def submit_attempt(attempt_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    require_access(db,user,"testing.take","edit")
     attempt = db.get(TrainingAttempt, attempt_id)
     employee = _current_employee(db, user)
     if not attempt or not employee or attempt.employee_id != employee.id:
@@ -691,14 +727,17 @@ def assignment_attempts(assignment_id: int, user=Depends(get_current_user), db: 
     a = db.get(TrainingAssignment, assignment_id)
     if not a:
         raise HTTPException(404, "Назначение не найдено")
-    employee = _current_employee(db, user)
-    if user.role not in EDITOR_ROLES and (not employee or a.employee_id != employee.id):
-        raise HTTPException(403, "Нет доступа")
+    employee=_current_employee(db,user)
+    if employee and a.employee_id==employee.id:
+        require_access(db,user,"testing.take")
+    else:
+        require_access(db,user,"testing.control")
+        if not _employee_allowed(db,user,a.employee_id,"testing.control"): raise HTTPException(403,"Нет доступа")
     rows = list(db.scalars(select(TrainingAttempt).where(TrainingAttempt.assignment_id == a.id).order_by(TrainingAttempt.attempt_no.desc())).all())
     return [{"id": x.id, "attempt_no": x.attempt_no, "status": x.status, "started_at": x.started_at, "completed_at": x.completed_at, "score_percent": float(x.score_percent) if x.score_percent is not None else None, "passed": x.passed} for x in rows]
 
 
 @router.post("/ai-draft")
-def ai_draft(user=Depends(get_current_user)):
-    _require_editor(user)
+def ai_draft(user=Depends(get_current_user), db:Session=Depends(get_db)):
+    require_access(db,user,"testing.create","edit")
     raise HTTPException(501, "Генерация теста через AI будет доступна после подключения AI-агента")

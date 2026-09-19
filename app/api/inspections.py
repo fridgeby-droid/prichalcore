@@ -11,7 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import APP_TIMEZONE, MIN_INSPECTIONS_PER_STORE_PER_WEEK
-from app.core.security import get_current_user, assert_store_access, MANAGEMENT_ROLES, user_store_ids
+from app.core.security import get_current_user
+from app.core.permissions import require_access, require_any_access, scope_store_ids, assert_store_scope, assigned_store_ids, effective_permission, has_access
 from app.db.database import get_db
 from app.db.models import (
     InspectionTemplate, InspectionTemplateStore, InspectionTemplateField,
@@ -25,9 +26,17 @@ SEVERITIES = {"low", "medium", "high", "critical"}
 FIELD_TYPES = {"boolean", "select", "number", "text", "textarea", "photo"}
 
 
-def _require_management(user):
-    if user.role not in MANAGEMENT_ROLES:
-        raise HTTPException(403, "Проверки доступны управляющим и руководству")
+def _require(db: Session, user, key: str, minimum: str = "view"):
+    return require_access(db,user,key,minimum)
+
+
+def _stores_for(db: Session,user,key: str):
+    p=require_access(db,user,key,"view")
+    if p["data_scope"]=="network":
+        return None
+    if p["data_scope"]=="stores":
+        return assigned_store_ids(db,user)
+    return []
 
 
 def _local_today():
@@ -144,28 +153,28 @@ class FormIn(BaseModel):
 
 @router.get("/meta")
 def meta(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
-    allowed = user_store_ids(db, user)
+    p=require_any_access(db,user,["inspections.conduct","inspections.control","inspections.history","inspections.forms"])
     q = select(Store).where(Store.active.is_(True)).order_by(Store.name)
-    if user.role not in {"operations_director","leader","admin"}: q = q.where(Store.id.in_(allowed or [-1]))
-    stores = db.scalars(q).all()
-    manager_ids = set(db.scalars(select(Inspection.manager_id).distinct()).all())
+    if p["data_scope"] != "network":
+        q=q.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
+    stores=db.scalars(q).all()
+    manager_ids=set(db.scalars(select(Inspection.manager_id).where(Inspection.store_id.in_([x.id for x in stores] or [-1])).distinct()).all())
     manager_ids.add(user.id)
-    managers = []
+    managers=[]
     for uid in sorted(manager_ids):
-        u = db.get(User, uid)
+        u=db.get(User,uid)
         if u: managers.append({"id":u.id,"name":u.full_name or u.username or str(u.telegram_id)})
     return {"stores":[{"id":s.id,"name":s.name} for s in stores],"managers":managers,"required_per_week":MIN_INSPECTIONS_PER_STORE_PER_WEEK,"severities":["low","medium","high","critical"]}
 
 
 @router.get("/forms")
 def forms(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
-    allowed = set(user_store_ids(db, user))
+    p=require_any_access(db,user,["inspections.conduct","inspections.forms"])
+    allowed=set(assigned_store_ids(db,user))
     result = []
     for t in db.scalars(select(InspectionTemplate).where(InspectionTemplate.active.is_(True)).order_by(InspectionTemplate.name)).all():
         store_ids = _template_store_ids(db, t.id)
-        if user.role == "manager" and store_ids and not (set(store_ids) & allowed):
+        if p["data_scope"] != "network" and store_ids and not (set(store_ids) & allowed):
             continue
         fs = db.scalars(select(InspectionTemplateField).where(InspectionTemplateField.template_id == t.id).order_by(InspectionTemplateField.sort_order, InspectionTemplateField.id)).all()
         used = db.scalar(select(func.count(Inspection.id)).where(Inspection.template_id == t.id)) or 0
@@ -178,13 +187,12 @@ def forms(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 @router.post("/forms")
 def create_form(payload: FormIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.forms","edit")
     name = payload.name.strip()
     if not name: raise HTTPException(400, "Укажите название формы")
     if not payload.fields: raise HTTPException(400, "Добавьте хотя бы один пункт")
-    allowed = set(user_store_ids(db, user))
     for sid in payload.store_ids:
-        if user.role == "manager" and sid not in allowed: raise HTTPException(403, "Нет доступа к магазину")
+        assert_store_scope(db,user,"inspections.forms",sid,minimum="edit",own_as_assigned=True)
         if not db.get(Store, sid): raise HTTPException(400, f"Магазин #{sid} не найден")
     t = InspectionTemplate(name=name, description=payload.description, active=True)
     db.add(t)
@@ -209,7 +217,7 @@ def create_form(payload: FormIn, user=Depends(get_current_user), db: Session = D
 
 @router.patch("/forms/{template_id}")
 def update_form(template_id: int, payload: FormIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.forms","edit")
     t = db.get(InspectionTemplate, template_id)
     if not t or not t.active: raise HTTPException(404, "Форма не найдена")
     used = db.scalar(select(func.count(Inspection.id)).where(Inspection.template_id == t.id)) or 0
@@ -238,7 +246,7 @@ def update_form(template_id: int, payload: FormIn, user=Depends(get_current_user
 
 @router.delete("/forms/{template_id}")
 def disable_form(template_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.forms","edit")
     t = db.get(InspectionTemplate, template_id)
     if not t: raise HTTPException(404, "Форма не найдена")
     t.active = False; t.updated_at = datetime.utcnow(); db.commit(); return {"ok": True}
@@ -246,8 +254,8 @@ def disable_form(template_id: int, user=Depends(get_current_user), db: Session =
 
 @router.get("/templates")
 def templates(store_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
-    if store_id is not None: assert_store_access(db, user, store_id)
+    require_access(db,user,"inspections.conduct")
+    if store_id is not None: assert_store_scope(db,user,"inspections.conduct",store_id,own_as_assigned=True)
     rows = forms(user, db)
     if store_id is not None:
         rows = [x for x in rows if not x["store_ids"] or store_id in x["store_ids"]]
@@ -261,7 +269,7 @@ class DraftIn(BaseModel):
 
 @router.post("/drafts")
 def start_draft(payload: DraftIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user); assert_store_access(db, user, payload.store_id)
+    require_access(db,user,"inspections.conduct","edit"); assert_store_scope(db,user,"inspections.conduct",payload.store_id,minimum="edit",own_as_assigned=True)
     t = db.get(InspectionTemplate, payload.template_id)
     if not t or not t.active: raise HTTPException(404, "Форма не найдена")
     if not _template_allowed_for_store(db, t.id, payload.store_id): raise HTTPException(400, "Эта форма не назначена выбранному магазину")
@@ -274,10 +282,10 @@ def start_draft(payload: DraftIn, user=Depends(get_current_user), db: Session = 
 
 @router.get("/drafts")
 def drafts(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
+    p=require_access(db,user,"inspections.conduct")
     q = select(Inspection).where(Inspection.status == "draft").order_by(Inspection.started_at.desc())
-    allowed = user_store_ids(db, user)
-    if user.role not in {"operations_director", "leader", "admin"}: q = q.where(Inspection.store_id.in_(allowed or [-1]))
+    if p["data_scope"]=="own": q=q.where(Inspection.manager_id==user.id)
+    elif p["data_scope"]=="stores": q=q.where(Inspection.store_id.in_(assigned_store_ids(db,user) or [-1]))
     return [{"id": x.id, "store_id": x.store_id, "store_name": _store_name(db,x.store_id), "template_id": x.template_id, "template_name": db.get(InspectionTemplate,x.template_id).name if db.get(InspectionTemplate,x.template_id) else None, "started_at": x.started_at.isoformat() if x.started_at else None} for x in db.scalars(q).all()]
 
 
@@ -309,10 +317,10 @@ def _detail(db: Session, obj: Inspection):
 
 @router.get("/{inspection_id}")
 def detail(inspection_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
+    require_any_access(db,user,["inspections.conduct","inspections.history","inspections.control"])
     obj = db.get(Inspection, inspection_id)
     if not obj: raise HTTPException(404, "Проверка не найдена")
-    assert_store_access(db, user, obj.store_id)
+    assert_store_scope(db,user,"inspections.conduct" if obj.status=="draft" else "inspections.history",obj.store_id,own_as_assigned=True)
     return _detail(db, obj)
 
 
@@ -331,11 +339,12 @@ class FinishIn(BaseModel):
 
 @router.post("/{inspection_id}/finish")
 def finish(inspection_id: int, payload: FinishIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.control")
     obj = db.get(Inspection, inspection_id)
     if not obj or obj.status != "draft": raise HTTPException(404, "Черновик проверки не найден")
-    assert_store_access(db, user, obj.store_id)
-    if obj.manager_id != user.id and user.role not in {"operations_director","leader","admin"}: raise HTTPException(403,"Завершить проверку может её автор")
+    assert_store_scope(db,user,"inspections.conduct" if obj.status=="draft" else "inspections.history",obj.store_id,own_as_assigned=True)
+    p=effective_permission(db,user,"inspections.conduct")
+    if p["data_scope"]=="own" and obj.manager_id!=user.id: raise HTTPException(403,"Завершить проверку может её автор")
     values = {v.id: v for v in db.scalars(select(InspectionValue).where(InspectionValue.inspection_id == obj.id)).all()}
     fields = {f.id: f for f in db.scalars(select(InspectionTemplateField).where(InspectionTemplateField.template_id == obj.template_id)).all()}
     incoming = {x.value_id: x for x in payload.values}
@@ -370,19 +379,19 @@ def finish(inspection_id: int, payload: FinishIn, user=Depends(get_current_user)
 
 @router.delete("/{inspection_id}/draft")
 def delete_draft(inspection_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.conduct","edit")
     obj=db.get(Inspection,inspection_id)
     if not obj or obj.status!="draft": raise HTTPException(404,"Черновик не найден")
-    assert_store_access(db,user,obj.store_id)
+    assert_store_scope(db,user,"inspections.conduct",obj.store_id,minimum="edit",own_as_assigned=True)
     db.delete(obj);db.commit();return {"ok":True}
 
 
 @router.get("")
 def list_all(store_id:int|None=None, manager_id:int|None=None, date_from:str|None=None, date_to:str|None=None, has_violations:bool|None=None, result:str|None=None, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_management(user)
+    p=require_access(db,user,"inspections.history")
     q=select(Inspection).where(Inspection.status=="completed").order_by(Inspection.completed_at.desc()).limit(300)
-    allowed=user_store_ids(db,user)
-    if user.role not in {"operations_director","leader","admin"}: q=q.where(Inspection.store_id.in_(allowed or [-1]))
+    if p["data_scope"]=="own": q=q.where(Inspection.manager_id==user.id)
+    elif p["data_scope"]=="stores": q=q.where(Inspection.store_id.in_(assigned_store_ids(db,user) or [-1]))
     if store_id:q=q.where(Inspection.store_id==store_id)
     if manager_id:q=q.where(Inspection.manager_id==manager_id)
     if date_from:
@@ -406,11 +415,10 @@ def list_all(store_id:int|None=None, manager_id:int|None=None, date_from:str|Non
 
 @router.get("/control/weekly")
 def weekly_control(user=Depends(get_current_user),db:Session=Depends(get_db)):
-    _require_management(user)
+    p=require_access(db,user,"inspections.control")
     monday,sunday,start,end=_week_bounds_utc()
-    allowed=user_store_ids(db,user)
     q=select(Store).where(Store.active.is_(True)).order_by(Store.name)
-    if user.role not in {"operations_director","leader","admin"}: q=q.where(Store.id.in_(allowed or [-1]))
+    if p["data_scope"]!="network": q=q.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
     stores=db.scalars(q).all();result=[]
     for s in stores:
         count=db.scalar(select(func.count(Inspection.id)).where(Inspection.store_id==s.id,Inspection.status=="completed",Inspection.completed_at>=start,Inspection.completed_at<end)) or 0
@@ -422,10 +430,9 @@ def weekly_control(user=Depends(get_current_user),db:Session=Depends(get_db)):
 
 @router.get("/violations/list")
 def violations(store_id:int|None=None,status:str|None="open",severity:str|None=None,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    _require_management(user)
+    p=require_access(db,user,"inspections.control")
     q=select(Violation).order_by(Violation.created_at.desc()).limit(300)
-    allowed=user_store_ids(db,user)
-    if user.role not in {"operations_director","leader","admin"}:q=q.where(Violation.store_id.in_(allowed or [-1]))
+    if p["data_scope"]!="network": q=q.where(Violation.store_id.in_(assigned_store_ids(db,user) or [-1]))
     if store_id:q=q.where(Violation.store_id==store_id)
     if status:q=q.where(Violation.status==status)
     if severity:q=q.where(Violation.severity==severity)
@@ -434,10 +441,10 @@ def violations(store_id:int|None=None,status:str|None="open",severity:str|None=N
 
 @router.patch("/violations/{violation_id}")
 def update_violation(violation_id:int,payload:dict,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.violation_close","edit")
     v=db.get(Violation,violation_id)
     if not v:raise HTTPException(404,"Нарушение не найдено")
-    assert_store_access(db,user,v.store_id)
+    assert_store_scope(db,user,"inspections.violation_close",v.store_id,minimum="edit",own_as_assigned=True)
     if "status" in payload:
         if payload["status"] not in {"open","resolved"}:raise HTTPException(400,"Неизвестный статус")
         v.status=payload["status"];v.resolved_at=datetime.utcnow() if v.status=="resolved" else None
@@ -450,20 +457,20 @@ def update_violation(violation_id:int,payload:dict,user=Depends(get_current_user
 
 @router.get("/violations/{violation_id}/task-prefill")
 def violation_task_prefill(violation_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.task_from_violation","edit")
     v=db.get(Violation,violation_id)
     if not v:raise HTTPException(404,"Нарушение не найдено")
-    assert_store_access(db,user,v.store_id)
+    assert_store_scope(db,user,"inspections.task_from_violation",v.store_id,minimum="edit",own_as_assigned=True)
     priority={"low":"low","medium":"medium","high":"high","critical":"urgent"}.get(v.severity,"medium")
     return {"violation_id":v.id,"title":f"Устранить нарушение: {v.title}","description":f"Нарушение по результатам проверки #{v.inspection_id}."+(f"\nКомментарий: {v.comment}" if v.comment else ""),"priority":priority,"store_ids":[v.store_id]}
 
 
 @router.post("/violations/{violation_id}/link-task/{task_id}")
 def link_task(violation_id:int,task_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    _require_management(user)
+    require_access(db,user,"inspections.task_from_violation","edit")
     v=db.get(Violation,violation_id)
     if not v:raise HTTPException(404,"Нарушение не найдено")
-    assert_store_access(db,user,v.store_id)
+    assert_store_scope(db,user,"inspections.task_from_violation",v.store_id,minimum="edit",own_as_assigned=True)
     task=db.get(TaskV2,task_id)
     if not task:raise HTTPException(400,"Задача не найдена")
     v.task_v2_id=task_id
