@@ -112,22 +112,14 @@ def get_current_user(authorization: str | None = Header(default=None), db: Sessi
         raise HTTPException(status_code=401, detail="Authorization required")
     raw = authorization.split(" ", 1)[1].strip()
     token_hash = hashlib.sha256(raw.encode()).hexdigest()
-
-    # Hot path: resolve session + user in one SQL statement. v1.7.10 did a
-    # session SELECT and then a second users SELECT on every API request.
-    row = db.execute(
-        select(AuthSession, User)
-        .join(User, User.id == AuthSession.user_id)
-        .where(AuthSession.token_hash == token_hash)
-    ).first()
-    if not row:
+    session = db.scalar(select(AuthSession).where(AuthSession.token_hash == token_hash))
+    if not session or session.expires_at < datetime.utcnow():
+        if session:
+            db.delete(session)
+            db.commit()
         raise HTTPException(status_code=401, detail="Session expired")
-    session, user = row
-    if session.expires_at < datetime.utcnow():
-        db.delete(session)
-        db.commit()
-        raise HTTPException(status_code=401, detail="Session expired")
-    if not user.active:
+    user = db.get(User, session.user_id)
+    if not user or not user.active:
         raise HTTPException(status_code=403, detail="User is inactive")
     if user.status != "active":
         raise HTTPException(status_code=403, detail="User is awaiting approval")

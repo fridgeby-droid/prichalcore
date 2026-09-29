@@ -115,6 +115,7 @@ def _article_visible_for_user(db: Session, user: User, article: KnowledgeArticle
 @router.get("/me")
 def profile_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
     employee = _employee_for_user(db, user)
+    db.commit(); db.refresh(employee)
     stores = _stores(db, employee.id, employee.primary_store_id)
     avatar = _avatar_photo(db, employee)
     mentorship = None

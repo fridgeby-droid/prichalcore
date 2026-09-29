@@ -1,4 +1,4 @@
-# Security baseline — v1.7.10, retained in Причал Core v1.7.11
+# Причал Core v1.7.10 — Security & Permissions Stabilization
 
 ## Что изменено
 

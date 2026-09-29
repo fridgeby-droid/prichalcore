@@ -363,30 +363,6 @@ def _seed_admin_roles():
         db.commit()
     finally: db.close()
 
-
-def _postgres_performance_upgrade(engine):
-    """Indexes used by the hot paths of the MiniApp dashboard and badges.
-
-    CREATE INDEX IF NOT EXISTS keeps this safe for existing Bothost databases
-    and for repeated deploys.
-    """
-    with engine.begin() as conn:
-        statements = [
-            "CREATE INDEX IF NOT EXISTS ix_orders_status_store_created ON orders(status, store_id, created_at)",
-            "CREATE INDEX IF NOT EXISTS ix_task_assignees_employee_status_created ON task_assignees(employee_id, status, created_at)",
-            "CREATE INDEX IF NOT EXISTS ix_task_assignees_status_task ON task_assignees(status, task_id)",
-            "CREATE INDEX IF NOT EXISTS ix_shift_reports_store_status_submitted ON shift_reports(store_id, status, submitted_at)",
-            "CREATE INDEX IF NOT EXISTS ix_shift_reports_employee_status_submitted ON shift_reports(employee_id, status, submitted_at)",
-            "CREATE INDEX IF NOT EXISTS ix_training_assignments_employee_status_created ON training_assignments(employee_id, status, created_at)",
-            "CREATE INDEX IF NOT EXISTS ix_inspections_store_status_completed ON inspections(store_id, status, completed_at)",
-            "CREATE INDEX IF NOT EXISTS ix_employee_stores_store_employee ON employee_stores(store_id, employee_id)",
-            "CREATE INDEX IF NOT EXISTS ix_photos_entity_created ON photos(entity_type, entity_id, created_at)",
-            "CREATE INDEX IF NOT EXISTS ix_work_shift_employee_date_type ON work_shift_assignments(employee_id, work_date, shift_type)",
-            "CREATE INDEX IF NOT EXISTS ix_telegram_delivery_status_created ON telegram_delivery_logs(status, created_at)",
-        ]
-        for ddl in statements:
-            conn.execute(text(ddl))
-
 def init_db():
     from app.db import models  # noqa: F401
     engine = get_engine()
@@ -399,7 +375,6 @@ def init_db():
         _postgres_profile_upgrade(engine)
         _postgres_telegram_upgrade(engine)
         _postgres_admin_center_upgrade(engine)
-        _postgres_performance_upgrade(engine)
     _seed_employees_from_users()
     _seed_knowledge_sections()
     _seed_telegram_message_templates()

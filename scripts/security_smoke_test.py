@@ -1,4 +1,4 @@
-"""Security regression smoke test retained for v1.7.11 (baseline introduced in v1.7.10).
+"""Security regression smoke test for v1.7.10.
 Run from project root: python scripts/security_smoke_test.py
 Uses an isolated SQLite database and never touches production DATABASE_URL.
 """
