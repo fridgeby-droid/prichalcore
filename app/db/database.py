@@ -411,28 +411,50 @@ def init_db():
 
 def db_health():
     engine = get_engine()
+    sample_count = 10
     total_started = time.perf_counter()
-    connect_started = time.perf_counter()
-    with engine.connect() as conn:
-        connected_at = time.perf_counter()
+    checkout_started = time.perf_counter()
 
-        query_started = time.perf_counter()
-        probe = conn.execute(text("SELECT 1")).scalar_one()
-        query_finished = time.perf_counter()
+    conn = engine.connect()
+    checked_out_at = time.perf_counter()
+    query_samples_ms = []
+    probe = None
+    db_name = "unknown"
+
+    try:
+        for _ in range(sample_count):
+            query_started = time.perf_counter()
+            probe = conn.execute(text("SELECT 1")).scalar_one()
+            query_finished = time.perf_counter()
+            query_samples_ms.append((query_finished - query_started) * 1000)
 
         try:
-            db_name = conn.execute(text("SELECT current_database()")).scalar_one()
+            db_name = conn.execute(text("SELECT current_database()")) .scalar_one()
         except Exception:
             db_name = "sqlite"
+    finally:
+        release_started = time.perf_counter()
+        conn.close()
+        released_at = time.perf_counter()
 
     total_finished = time.perf_counter()
+    ordered = sorted(query_samples_ms)
+    p95_index = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * 0.95 + 0.999999)))
+
     return {
         "probe": probe,
         "database_name": db_name,
-        "connect_ms": round((connected_at - connect_started) * 1000, 2),
-        "query_ms": round((query_finished - query_started) * 1000, 2),
+        "sample_count": sample_count,
+        "checkout_ms": round((checked_out_at - checkout_started) * 1000, 2),
+        "query_first_ms": round(query_samples_ms[0], 2),
+        "query_min_ms": round(min(query_samples_ms), 2),
+        "query_avg_ms": round(sum(query_samples_ms) / len(query_samples_ms), 2),
+        "query_max_ms": round(max(query_samples_ms), 2),
+        "query_p95_ms": round(ordered[p95_index], 2),
+        "query_samples_ms": [round(v, 2) for v in query_samples_ms],
+        "release_ms": round((released_at - release_started) * 1000, 2),
         "total_ms": round((total_finished - total_started) * 1000, 2),
-        "connection_mode": "sqlalchemy_pool_checkout",
+        "connection_mode": "sqlalchemy_pool_checkout_single_connection",
     }
 
 
