@@ -39,17 +39,42 @@ def role_key(user) -> str:
     return getattr(user, "role_key", None) or getattr(user, "role", "seller")
 
 
-def effective_permission(db: Session, user, key: str) -> dict[str, str]:
+def _request_cache(db: Session) -> dict:
+    """Per-SQLAlchemy-session cache.
+
+    FastAPI creates one Session per request, so this cache is request-scoped:
+    it removes duplicate SQL inside a request without making role changes stale
+    across requests.
+    """
+    return db.info.setdefault("core_request_cache", {})
+
+
+def permission_map(db: Session, user) -> dict[str, dict[str, str]]:
+    """Load the full permission matrix for the current role once per request."""
     from app.db.models import RolePermission
+
+    rk = role_key(user)
+    if rk == "admin":
+        return {k: {"access_level": "edit", "data_scope": "network"} for k in all_keys()}
+
+    cache = _request_cache(db)
+    cache_key = ("permissions", rk)
+    if cache_key not in cache:
+        rows = db.scalars(select(RolePermission).where(RolePermission.role_key == rk)).all()
+        cache[cache_key] = {
+            row.permission_key: {
+                "access_level": row.access_level if row.access_level in ACCESS_RANK else "hidden",
+                "data_scope": row.data_scope if row.data_scope in DATA_SCOPES else "own",
+            }
+            for row in rows
+        }
+    return cache[cache_key]
+
+
+def effective_permission(db: Session, user, key: str) -> dict[str, str]:
     if role_key(user) == "admin":
         return {"access_level": "edit", "data_scope": "network"}
-    obj = db.get(RolePermission, {"role_key": role_key(user), "permission_key": key})
-    if not obj:
-        return {"access_level": "hidden", "data_scope": "own"}
-    return {
-        "access_level": obj.access_level if obj.access_level in ACCESS_RANK else "hidden",
-        "data_scope": obj.data_scope if obj.data_scope in DATA_SCOPES else "own",
-    }
+    return permission_map(db, user).get(key, {"access_level": "hidden", "data_scope": "own"})
 
 
 def has_access(db: Session, user, key: str, minimum: str = "view") -> bool:
@@ -82,20 +107,43 @@ def permission_required(key: str, minimum: str = "view"):
 
 def current_employee(db: Session, user):
     from app.db.models import Employee
-    return db.scalar(select(Employee).where(Employee.user_id==user.id,Employee.active.is_(True)))
+    cache = _request_cache(db)
+    key = ("employee", user.id)
+    if key not in cache:
+        cache[key] = db.scalar(
+            select(Employee).where(Employee.user_id == user.id, Employee.active.is_(True))
+        )
+    return cache[key]
 
 
 def assigned_store_ids(db: Session, user) -> list[int]:
-    from app.db.models import UserStore,EmployeeStore,Employee
-    ids=set(db.scalars(select(UserStore.store_id).where(UserStore.user_id==user.id)).all())
-    emp=db.scalar(select(Employee).where(Employee.user_id==user.id,Employee.active.is_(True)))
-    if emp: ids.update(db.scalars(select(EmployeeStore.store_id).where(EmployeeStore.employee_id==emp.id)).all())
-    return sorted(ids)
+    from app.db.models import UserStore, EmployeeStore
+
+    cache = _request_cache(db)
+    key = ("assigned_store_ids", user.id)
+    if key in cache:
+        return cache[key]
+
+    ids = set(db.scalars(select(UserStore.store_id).where(UserStore.user_id == user.id)).all())
+    emp = current_employee(db, user)
+    if emp:
+        ids.update(
+            db.scalars(
+                select(EmployeeStore.store_id).where(EmployeeStore.employee_id == emp.id)
+            ).all()
+        )
+    value = sorted(ids)
+    cache[key] = value
+    return value
 
 
 def all_active_store_ids(db: Session) -> list[int]:
     from app.db.models import Store
-    return list(db.scalars(select(Store.id).where(Store.active.is_(True))).all())
+    cache = _request_cache(db)
+    key = ("active_store_ids",)
+    if key not in cache:
+        cache[key] = list(db.scalars(select(Store.id).where(Store.active.is_(True))).all())
+    return cache[key]
 
 
 def scope_store_ids(db: Session,user,key:str,*,own_as_assigned:bool=False) -> list[int]:
