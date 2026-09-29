@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import APP_ENV, AUTO_SET_WEBHOOK, ENABLE_SCHEDULER, LOG_LEVEL, PORT, TELEGRAM_WEBHOOK_SECRET
@@ -31,15 +33,29 @@ async def lifespan(app:FastAPI):
     yield
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.10",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.11",lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+@app.middleware("http")
+async def performance_headers(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["X-Process-Time-ms"] = f"{elapsed_ms:.1f}"
+    if request.url.path.startswith("/static/app.1.7.11."):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    if request.url.path.startswith("/api/") and elapsed_ms >= 150:
+        log.info("Slow API %.1f ms %s %s", elapsed_ms, request.method, request.url.path)
+    return response
+
 register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.10","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.11","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.10","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.11","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():
