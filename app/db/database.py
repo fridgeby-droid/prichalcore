@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import time
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from app.core.config import DATABASE_URL
@@ -410,13 +411,29 @@ def init_db():
 
 def db_health():
     engine = get_engine()
+    total_started = time.perf_counter()
+    connect_started = time.perf_counter()
     with engine.connect() as conn:
+        connected_at = time.perf_counter()
+
+        query_started = time.perf_counter()
         probe = conn.execute(text("SELECT 1")).scalar_one()
+        query_finished = time.perf_counter()
+
         try:
             db_name = conn.execute(text("SELECT current_database()")).scalar_one()
         except Exception:
             db_name = "sqlite"
-        return {"probe": probe, "database_name": db_name}
+
+    total_finished = time.perf_counter()
+    return {
+        "probe": probe,
+        "database_name": db_name,
+        "connect_ms": round((connected_at - connect_started) * 1000, 2),
+        "query_ms": round((query_finished - query_started) * 1000, 2),
+        "total_ms": round((total_finished - total_started) * 1000, 2),
+        "connection_mode": "sqlalchemy_pool_checkout",
+    }
 
 
 @contextmanager
