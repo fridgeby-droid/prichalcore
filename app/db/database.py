@@ -477,6 +477,11 @@ def init_db():
                 from app.db.media_migration import upgrade
                 upgrade(engine)
                 lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('media-1.7.12')"));lock.commit()
+            if 'directories-1.7.15' not in done:
+                models.CoreDirectoryState.__table__.create(engine,checkfirst=True)
+                models.CoreDirectoryLink.__table__.create(engine,checkfirst=True)
+                lock.execute(text("INSERT INTO core_directory_state(id,status) VALUES (1,'never') ON CONFLICT (id) DO NOTHING"))
+                lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('directories-1.7.15')"));lock.commit()
         finally:
             if engine.dialect.name=='postgresql':
                 lock.execute(text("SELECT pg_advisory_unlock(714118)"));lock.commit()

@@ -4,7 +4,7 @@ const vm=require('node:vm');
 const fs=require('node:fs');
 const path=require('node:path');
 const ctx=vm.createContext({URLSearchParams,DOMException});
-vm.runInContext(fs.readFileSync(path.join(__dirname,'../miniapp/cache.1.7.14.js'),'utf8')+';globalThis.Cache=CoreDataCache;',ctx);
+vm.runInContext(fs.readFileSync(path.join(__dirname,'../miniapp/cache.1.7.15.js'),'utf8')+';globalThis.Cache=CoreDataCache;',ctx);
 const flush=()=>new Promise(r=>setImmediate(r));
 function fixture(opts={}){let token='A',now=0,calls=0,version=1;const changes=[],denied=[];const cache=new ctx.Cache({token:()=>token,now:()=>now,changed:(...v)=>changes.push(v),denied:e=>denied.push(e),...opts});return {cache,changes,denied,setToken:v=>token=v,setTime:v=>now=v,setVersion:v=>version=v,calls:()=>calls,read:(p='/api/tasks-v2',o={})=>cache.read(p,o,async()=>{calls++;return {version};})};}
 test('fresh navigation hits memory and returns independent objects',async()=>{const f=fixture();const a=await f.read();a.version=999;assert.equal((await f.read()).version,1);assert.equal(f.calls(),1);});

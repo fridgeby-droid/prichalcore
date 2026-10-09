@@ -1049,3 +1049,30 @@ class TelegramInbox(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class CoreDirectoryState(Base):
+    __tablename__ = 'core_directory_state'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    attempted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default='never')
+    error: Mapped[str | None] = mapped_column(String(240), nullable=True)
+
+
+class CoreDirectoryLink(Base):
+    __tablename__ = 'core_directory_links'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    saby_id: Mapped[str] = mapped_column(String(128))
+    store_id: Mapped[int | None] = mapped_column(ForeignKey('stores.id', ondelete='SET NULL'), nullable=True, unique=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey('employees.id', ondelete='SET NULL'), nullable=True, index=True)
+    shared: Mapped[bool] = mapped_column(Boolean, default=False)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    label: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+    __table_args__ = (UniqueConstraint('kind', 'saby_id', name='uq_core_directory_identity'),)
