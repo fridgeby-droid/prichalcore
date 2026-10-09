@@ -68,6 +68,10 @@ def get_engine():
             if sslmode:
                 connect_args["sslmode"] = sslmode
             ca_path = _database_ssl_ca_path()
+            if not ca_path:
+                bundled_ca = Path("/app/certs/timeweb-root.crt")
+                if bundled_ca.exists():
+                    ca_path = str(bundled_ca)
             if ca_path:
                 connect_args["sslrootcert"] = ca_path
             if connect_args:
