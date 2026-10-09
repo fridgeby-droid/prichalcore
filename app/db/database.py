@@ -64,6 +64,9 @@ def get_engine():
             kwargs["connect_args"] = {"check_same_thread": False}
         else:
             connect_args = {}
+            sslmode = os.getenv("DATABASE_SSLMODE", "").strip()
+            if sslmode:
+                connect_args["sslmode"] = sslmode
             ca_path = _database_ssl_ca_path()
             if ca_path:
                 connect_args["sslrootcert"] = ca_path
