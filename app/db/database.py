@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import base64
+import binascii
+import os
+from pathlib import Path
 import time
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -23,6 +27,32 @@ _engine = None
 SessionLocal = None
 
 
+def _database_ssl_ca_path() -> str | None:
+    """Materialize a PostgreSQL CA certificate supplied via environment.
+
+    DATABASE_SSL_CA_B64 should contain the base64-encoded PEM certificate.
+    The certificate is written to /tmp because the container filesystem outside
+    the application directory should not be assumed to be writable/persistent.
+    """
+    raw = os.getenv("DATABASE_SSL_CA_B64", "").strip()
+    if not raw:
+        return None
+
+    try:
+        pem = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError("DATABASE_SSL_CA_B64 is not valid base64") from exc
+
+    if b"-----BEGIN CERTIFICATE-----" not in pem or b"-----END CERTIFICATE-----" not in pem:
+        raise RuntimeError("DATABASE_SSL_CA_B64 does not contain a PEM certificate")
+
+    ca_path = Path("/tmp/prichal_core_postgres_root.crt")
+    if not ca_path.exists() or ca_path.read_bytes() != pem:
+        ca_path.write_bytes(pem)
+        ca_path.chmod(0o600)
+    return str(ca_path)
+
+
 def get_engine():
     global _engine, SessionLocal
     if _engine is None:
@@ -33,6 +63,12 @@ def get_engine():
         if url.startswith("sqlite"):
             kwargs["connect_args"] = {"check_same_thread": False}
         else:
+            connect_args = {}
+            ca_path = _database_ssl_ca_path()
+            if ca_path:
+                connect_args["sslrootcert"] = ca_path
+            if connect_args:
+                kwargs["connect_args"] = connect_args
             kwargs.update({"pool_size": 5, "max_overflow": 10, "pool_recycle": 300})
         _engine = create_engine(url, **kwargs)
         SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, expire_on_commit=False)
