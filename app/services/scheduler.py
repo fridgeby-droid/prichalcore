@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 import threading
+import logging
+import time
 
 from app.core.config import APP_TIMEZONE, MIN_INSPECTIONS_PER_STORE_PER_WEEK, PLAN_ALERT_THRESHOLD
 from app.db.database import session_scope
@@ -13,7 +15,6 @@ from app.db.models import (
     Order, ShiftTemplate, ShiftReport, Task, Inspection, PlanFact
 )
 from app.services.telegram import send_message
-from app.services.notifications import process_pending_personal_deliveries
 
 _scheduler_thread = None
 _stop_event = threading.Event()
@@ -24,26 +25,32 @@ def _local_now():
 
 
 def _sent(db: Session, key: str) -> bool:
-    return db.scalar(select(NotificationLog.id).where(NotificationLog.dedupe_key == key)) is not None
+    if "scheduler_sent" not in db.info:
+        db.info["scheduler_sent"]=set(db.scalars(select(NotificationLog.dedupe_key).where(NotificationLog.created_at>=datetime.utcnow()-timedelta(days=8))).all())
+    return key in db.info["scheduler_sent"]
 
 
 def _mark(db: Session, key: str, user_id: int | None, kind: str):
     if not _sent(db,key):
         db.add(NotificationLog(dedupe_key=key,user_id=user_id,kind=kind))
+        db.info["scheduler_sent"].add(key)
 
 
 def _users_for(db: Session, roles: list[str] | None, store_ids: list[int] | None):
-    q=select(User).where(User.active.is_(True),User.status=="active")
-    if roles:q=q.where(User.role.in_(roles))
-    users=db.scalars(q).all()
-    if not store_ids:return users
-    result=[]
-    leadership={"operations_director","leader","admin"}
-    for u in users:
-        if u.role in leadership: result.append(u); continue
-        linked=set(db.scalars(select(UserStore.store_id).where(UserStore.user_id==u.id)).all())
-        if linked.intersection(set(store_ids)):result.append(u)
-    return result
+    if 'scheduler_users' not in db.info:
+        db.info['scheduler_users']=list(db.scalars(select(User).where(User.active.is_(True),User.status=="active")).all())
+        links={}
+        for uid,sid in db.execute(select(UserStore.user_id,UserStore.store_id)).all():links.setdefault(uid,set()).add(sid)
+        db.info['scheduler_stores']=links
+    stores=set(store_ids or [])
+    return [u for u in db.info['scheduler_users'] if (not roles or u.role in roles) and (not stores or u.role in {"operations_director","leader","admin"} or stores.intersection(db.info['scheduler_stores'].get(u.id,set())))]
+
+
+def _queue_alert(db,key,chat_id,text,markup=None):
+    from app.db.models import TelegramDeliveryLog
+    if key not in db.info.setdefault("queued_alerts",set()):
+        db.info["queued_alerts"].add(key)
+        db.add(TelegramDeliveryLog(event_type="scheduled_alert",entity_type="scheduler",entity_id=0,chat_id=chat_id,dedupe_key=key,status="pending",payload_json={"text":text,"reply_markup":markup}))
 
 
 def process_broadcasts():
@@ -57,7 +64,7 @@ def process_broadcasts():
                 markup=None
                 if b.button_text and b.button_url:markup={"inline_keyboard":[[{"text":b.button_text,"url":b.button_url}]]}
                 try:
-                    send_message(u.telegram_id,b.message,markup);_mark(db,key,u.id,"broadcast")
+                    _queue_alert(db,key,u.telegram_id,b.message,markup);_mark(db,key,u.id,"broadcast")
                 except Exception:
                     pass
 
@@ -72,7 +79,7 @@ def process_task_alerts():
             key=f"task-overdue:{t.id}:{day}:{u.id}"
             if _sent(db,key):continue
             try:
-                send_message(u.telegram_id,f"🔴 <b>Просрочена задача</b>\n{t.title}")
+                _queue_alert(db,key,u.telegram_id,f"🔴 <b>Просрочена задача</b>\n{t.title}")
                 _mark(db,key,u.id,"task_overdue")
             except Exception:pass
 
@@ -91,7 +98,7 @@ def process_order_deadlines():
                 key=f"order-missing:{store.id}:{sup.id}:{day}:{u.id}"
                 if _sent(db,key):continue
                 try:
-                    send_message(u.telegram_id,f"⚠️ <b>Нет заявки поставщику</b>\n{store.name} — {sup.name}\nСрок: {sup.deadline_time}")
+                    _queue_alert(db,key,u.telegram_id,f"⚠️ <b>Нет заявки поставщику</b>\n{store.name} — {sup.name}\nСрок: {sup.deadline_time}")
                     _mark(db,key,u.id,"order_missing")
                 except Exception:pass
 
@@ -111,7 +118,7 @@ def process_shift_deadlines():
                 key=f"shift-missing:{kind}:{store.id}:{day}:{u.id}"
                 if _sent(db,key):continue
                 try:
-                    send_message(u.telegram_id,f"🔴 <b>Не сдана пересменка</b>\n{store.name} — {t.name}")
+                    _queue_alert(db,key,u.telegram_id,f"🔴 <b>Не сдана пересменка</b>\n{store.name} — {t.name}")
                     _mark(db,key,u.id,"shift_missing")
                 except Exception:pass
 
@@ -121,14 +128,15 @@ def process_inspection_control():
     if now.weekday()!=4 or now.strftime("%H:%M")!="18:00":return
     ws=now.date()-timedelta(days=now.weekday()); start=datetime.combine(ws,datetime.min.time())
     with session_scope() as db:
+        counts=dict(db.execute(select(Inspection.store_id,func.count(Inspection.id)).where(Inspection.completed_at>=start).group_by(Inspection.store_id)).all())
         for store in db.scalars(select(Store).where(Store.active.is_(True))).all():
-            count=db.scalar(select(func.count(Inspection.id)).where(Inspection.store_id==store.id,Inspection.completed_at>=start)) or 0
+            count=counts.get(store.id,0)
             if count>=MIN_INSPECTIONS_PER_STORE_PER_WEEK:continue
             for u in _users_for(db,["manager","operations_director","leader","admin"],[store.id]):
                 key=f"inspection-shortage:{store.id}:{ws}:{u.id}"
                 if _sent(db,key):continue
                 try:
-                    send_message(u.telegram_id,f"⚠️ <b>Недостаточно проверок точки</b>\n{store.name}: {count}/{MIN_INSPECTIONS_PER_STORE_PER_WEEK} за неделю")
+                    _queue_alert(db,key,u.telegram_id,f"⚠️ <b>Недостаточно проверок точки</b>\n{store.name}: {count}/{MIN_INSPECTIONS_PER_STORE_PER_WEEK} за неделю")
                     _mark(db,key,u.id,"inspection_shortage")
                 except Exception:pass
 
@@ -147,26 +155,35 @@ def process_plan_alerts():
                 key=f"plan-low:{store.id}:{ws}:{now.date()}:{u.id}"
                 if _sent(db,key):continue
                 try:
-                    send_message(u.telegram_id,f"📉 <b>План ниже контрольного уровня</b>\n{store.name}: {ratio*100:.1f}%")
+                    _queue_alert(db,key,u.telegram_id,f"📉 <b>План ниже контрольного уровня</b>\n{store.name}: {ratio*100:.1f}%")
                     _mark(db,key,u.id,"plan_low")
                 except Exception:pass
 
 
 
-def process_telegram_delivery_queue():
-    with session_scope() as db:
-        process_pending_personal_deliveries(db, limit=25)
 
 def scheduler_tick():
-    process_telegram_delivery_queue();process_broadcasts();process_task_alerts();process_order_deadlines();process_shift_deadlines();process_inspection_control();process_plan_alerts()
+    process_broadcasts();process_task_alerts();process_order_deadlines();process_shift_deadlines();process_inspection_control();process_plan_alerts()
 
 
 def _loop():
+    last_minute=None
     while not _stop_event.is_set():
         try:
-            scheduler_tick()
+            # Scheduled rules run once per minute; outbound queue has its own worker.
+            minute=_local_now().strftime("%Y-%m-%d %H:%M")
+            if minute!=last_minute:
+                from app.db.database import get_engine
+                from sqlalchemy import text
+                with get_engine().connect() as leader:
+                    acquired=True
+                    if leader.dialect.name=="postgresql":acquired=leader.execute(text("SELECT pg_try_advisory_lock(714119)")).scalar()
+                    try:
+                        if acquired:scheduler_tick();last_minute=minute
+                    finally:
+                        if acquired and leader.dialect.name=="postgresql":leader.execute(text("SELECT pg_advisory_unlock(714119)"))
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("Scheduler tick failed")
         _stop_event.wait(30)
 
 

@@ -6,7 +6,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, case, or_
+from app.services.batching import preload, grouped
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -91,7 +92,10 @@ def _template_allowed_for_store(db: Session, template_id: int, store_id: int):
 
 
 def _photo_payload(db: Session, entity_type: str, entity_id: int):
-    rows = db.scalars(select(Photo).where(Photo.entity_type == entity_type, Photo.entity_id == entity_id).order_by(Photo.created_at)).all()
+    cache=db.info.get("inspection_photos", {})
+    rows = cache.get((entity_type,entity_id))
+    if rows is None:
+        rows = db.scalars(select(Photo).where(Photo.entity_type == entity_type, Photo.entity_id == entity_id).order_by(Photo.created_at)).all()
     return [{"id": p.id, "label": p.label, "created_at": p.created_at.isoformat()} for p in rows]
 
 
@@ -160,6 +164,7 @@ def meta(user=Depends(get_current_user), db: Session = Depends(get_db)):
     stores=db.scalars(q).all()
     manager_ids=set(db.scalars(select(Inspection.manager_id).where(Inspection.store_id.in_([x.id for x in stores] or [-1])).distinct()).all())
     manager_ids.add(user.id)
+    preload(db,User,manager_ids)
     managers=[]
     for uid in sorted(manager_ids):
         u=db.get(User,uid)
@@ -172,12 +177,17 @@ def forms(user=Depends(get_current_user), db: Session = Depends(get_db)):
     p=require_any_access(db,user,["inspections.conduct","inspections.forms"])
     allowed=set(assigned_store_ids(db,user))
     result = []
-    for t in db.scalars(select(InspectionTemplate).where(InspectionTemplate.active.is_(True)).order_by(InspectionTemplate.name)).all():
-        store_ids = _template_store_ids(db, t.id)
+    templates=list(db.scalars(select(InspectionTemplate).where(InspectionTemplate.active.is_(True)).order_by(InspectionTemplate.name)).all())
+    ids=[t.id for t in templates]
+    stores=grouped(db,InspectionTemplateStore,InspectionTemplateStore.template_id,ids)
+    fields=grouped(db,InspectionTemplateField,InspectionTemplateField.template_id,ids,InspectionTemplateField.sort_order)
+    counts=dict(db.execute(select(Inspection.template_id,func.count(Inspection.id)).where(Inspection.template_id.in_(ids)).group_by(Inspection.template_id)).all())
+    for t in templates:
+        store_ids = [x.store_id for x in stores[t.id]]
         if p["data_scope"] != "network" and store_ids and not (set(store_ids) & allowed):
             continue
-        fs = db.scalars(select(InspectionTemplateField).where(InspectionTemplateField.template_id == t.id).order_by(InspectionTemplateField.sort_order, InspectionTemplateField.id)).all()
-        used = db.scalar(select(func.count(Inspection.id)).where(Inspection.template_id == t.id)) or 0
+        fs=fields[t.id]
+        used=counts.get(t.id,0)
         result.append({
             "id": t.id, "name": t.name, "description": t.description, "store_ids": store_ids,
             "fields": [_field_payload(f) for f in fs], "used_count": int(used),
@@ -289,10 +299,19 @@ def drafts(user=Depends(get_current_user), db: Session = Depends(get_db)):
     return [{"id": x.id, "store_id": x.store_id, "store_name": _store_name(db,x.store_id), "template_id": x.template_id, "template_name": db.get(InspectionTemplate,x.template_id).name if db.get(InspectionTemplate,x.template_id) else None, "started_at": x.started_at.isoformat() if x.started_at else None} for x in db.scalars(q).all()]
 
 
+def _preload_photos(db, obj, ids):
+    cache = db.info.setdefault("inspection_photos", {})
+    for vid in ids: cache[("inspection_value",vid)] = []
+    cache[("inspection",obj.id)] = []
+    for p in db.scalars(select(Photo).where(or_((Photo.entity_type=="inspection") & (Photo.entity_id==obj.id),(Photo.entity_type=="inspection_value") & Photo.entity_id.in_(ids))).order_by(Photo.created_at)).all():
+        cache[(p.entity_type,p.entity_id)].append(p)
+
+
 def _detail(db: Session, obj: Inspection):
     t = db.get(InspectionTemplate, obj.template_id)
     fields = {f.id: f for f in db.scalars(select(InspectionTemplateField).where(InspectionTemplateField.template_id == obj.template_id)).all()}
     vals = db.scalars(select(InspectionValue).where(InspectionValue.inspection_id == obj.id).order_by(InspectionValue.id)).all()
+    _preload_photos(db,obj,[v.id for v in vals])
     violations = db.scalars(select(Violation).where(Violation.inspection_id == obj.id).order_by(Violation.created_at)).all()
     return {
         "id": obj.id, "store_id": obj.store_id, "store_name": _store_name(db,obj.store_id),
@@ -340,13 +359,14 @@ class FinishIn(BaseModel):
 @router.post("/{inspection_id}/finish")
 def finish(inspection_id: int, payload: FinishIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"inspections.control")
-    obj = db.get(Inspection, inspection_id)
+    obj = db.get(Inspection,inspection_id,with_for_update=True,populate_existing=True)
     if not obj or obj.status != "draft": raise HTTPException(404, "Черновик проверки не найден")
     assert_store_scope(db,user,"inspections.conduct" if obj.status=="draft" else "inspections.history",obj.store_id,own_as_assigned=True)
     p=effective_permission(db,user,"inspections.conduct")
     if p["data_scope"]=="own" and obj.manager_id!=user.id: raise HTTPException(403,"Завершить проверку может её автор")
     values = {v.id: v for v in db.scalars(select(InspectionValue).where(InspectionValue.inspection_id == obj.id)).all()}
     fields = {f.id: f for f in db.scalars(select(InspectionTemplateField).where(InspectionTemplateField.template_id == obj.template_id)).all()}
+    _preload_photos(db,obj,list(values))
     incoming = {x.value_id: x for x in payload.values}
     db.execute(delete(Violation).where(Violation.inspection_id == obj.id))
     scored = []
@@ -380,16 +400,16 @@ def finish(inspection_id: int, payload: FinishIn, user=Depends(get_current_user)
 @router.delete("/{inspection_id}/draft")
 def delete_draft(inspection_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
     require_access(db,user,"inspections.conduct","edit")
-    obj=db.get(Inspection,inspection_id)
+    obj=db.get(Inspection,inspection_id,with_for_update=True,populate_existing=True)
     if not obj or obj.status!="draft": raise HTTPException(404,"Черновик не найден")
     assert_store_scope(db,user,"inspections.conduct",obj.store_id,minimum="edit",own_as_assigned=True)
     db.delete(obj);db.commit();return {"ok":True}
 
 
 @router.get("")
-def list_all(store_id:int|None=None, manager_id:int|None=None, date_from:str|None=None, date_to:str|None=None, has_violations:bool|None=None, result:str|None=None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def list_all(store_id:int|None=None, manager_id:int|None=None, date_from:str|None=None, date_to:str|None=None, has_violations:bool|None=None, result:str|None=None, limit:int=50, offset:int=0, user=Depends(get_current_user), db: Session = Depends(get_db)):
     p=require_access(db,user,"inspections.history")
-    q=select(Inspection).where(Inspection.status=="completed").order_by(Inspection.completed_at.desc()).limit(300)
+    q=select(Inspection).where(Inspection.status=="completed").order_by(Inspection.completed_at.desc(),Inspection.id.desc())
     if p["data_scope"]=="own": q=q.where(Inspection.manager_id==user.id)
     elif p["data_scope"]=="stores": q=q.where(Inspection.store_id.in_(assigned_store_ids(db,user) or [-1]))
     if store_id:q=q.where(Inspection.store_id==store_id)
@@ -400,10 +420,19 @@ def list_all(store_id:int|None=None, manager_id:int|None=None, date_from:str|Non
     if date_to:
         try:q=q.where(Inspection.completed_at<datetime.fromisoformat(date_to)+timedelta(days=1))
         except ValueError:pass
-    rows=list(db.scalars(q).all())
+    exists=select(Violation.id).where(Violation.inspection_id==Inspection.id).exists()
+    if has_violations is not None: q=q.where(exists if has_violations else ~exists)
+    if result:
+        # Same thresholds as _result_key.
+        conditions={"good":Inspection.score>=90,"attention":(Inspection.score>=70)&(Inspection.score<90),"poor":Inspection.score<70,"neutral":Inspection.score.is_(None)}
+        if result not in conditions: raise HTTPException(400,"Неизвестный результат")
+        q=q.where(conditions[result])
+    rows=list(db.scalars(q.limit(max(1,min(limit,100))).offset(max(0,offset))).all())
+    counts=dict(db.execute(select(Violation.inspection_id,func.count(Violation.id)).where(Violation.inspection_id.in_([x.id for x in rows])).group_by(Violation.inspection_id)).all())
+    preload(db,Store,[x.store_id for x in rows]);preload(db,User,[x.manager_id for x in rows]);preload(db,InspectionTemplate,[x.template_id for x in rows])
     out=[]
     for x in rows:
-        vc=db.scalar(select(func.count(Violation.id)).where(Violation.inspection_id==x.id)) or 0
+        vc=counts.get(x.id,0)
         score=float(x.score) if x.score is not None else None
         rk=_result_key(score)
         if has_violations is True and not vc:continue
@@ -420,10 +449,12 @@ def weekly_control(user=Depends(get_current_user),db:Session=Depends(get_db)):
     q=select(Store).where(Store.active.is_(True)).order_by(Store.name)
     if p["data_scope"]!="network": q=q.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
     stores=db.scalars(q).all();result=[]
+    ids=[s.id for s in stores]
+    counts=dict(db.execute(select(Inspection.store_id,func.count(Inspection.id)).where(Inspection.store_id.in_(ids),Inspection.status=="completed",Inspection.completed_at>=start,Inspection.completed_at<end).group_by(Inspection.store_id)).all())
+    violations={sid:(n,c) for sid,n,c in db.execute(select(Violation.store_id,func.count(Violation.id),func.sum(case((Violation.severity=="critical",1),else_=0))).where(Violation.store_id.in_(ids),Violation.status=="open").group_by(Violation.store_id)).all()}
     for s in stores:
-        count=db.scalar(select(func.count(Inspection.id)).where(Inspection.store_id==s.id,Inspection.status=="completed",Inspection.completed_at>=start,Inspection.completed_at<end)) or 0
-        open_v=db.scalar(select(func.count(Violation.id)).where(Violation.store_id==s.id,Violation.status=="open")) or 0
-        critical=db.scalar(select(func.count(Violation.id)).where(Violation.store_id==s.id,Violation.status=="open",Violation.severity=="critical")) or 0
+        count=counts.get(s.id,0)
+        open_v,critical=violations.get(s.id,(0,0))
         result.append({"store_id":s.id,"store_name":s.name,"count":int(count),"required":MIN_INSPECTIONS_PER_STORE_PER_WEEK,"complete":count>=MIN_INSPECTIONS_PER_STORE_PER_WEEK,"remaining":max(0,MIN_INSPECTIONS_PER_STORE_PER_WEEK-int(count)),"open_violations":int(open_v),"critical_violations":int(critical)})
     return {"week_from":monday.isoformat(),"week_to":sunday.isoformat(),"required":MIN_INSPECTIONS_PER_STORE_PER_WEEK,"stores":result}
 
@@ -471,7 +502,7 @@ def link_task(violation_id:int,task_id:int,user=Depends(get_current_user),db:Ses
     v=db.get(Violation,violation_id)
     if not v:raise HTTPException(404,"Нарушение не найдено")
     assert_store_scope(db,user,"inspections.task_from_violation",v.store_id,minimum="edit",own_as_assigned=True)
-    task=db.get(TaskV2,task_id)
+    task=db.get(TaskV2,task_id,with_for_update=True)
     if not task:raise HTTPException(400,"Задача не найдена")
     v.task_v2_id=task_id
 
@@ -486,12 +517,16 @@ def link_task(violation_id:int,task_id:int,user=Depends(get_current_user),db:Ses
     copied=0
     for a in assignees:
         existing=set(db.scalars(select(TaskAttachment.telegram_file_unique_id).where(TaskAttachment.task_id==task.id,TaskAttachment.assignee_id==a.id)).all())
+        existing_media=set(db.scalars(select(TaskAttachment.media_id).where(TaskAttachment.task_id==task.id,TaskAttachment.assignee_id==a.id)).all())
         for p in source_photos:
+            if p.media_id and p.media_id in existing_media: continue
             if p.telegram_file_unique_id and p.telegram_file_unique_id in existing:
                 continue
+            existing_media.add(p.media_id)
+            if p.telegram_file_unique_id: existing.add(p.telegram_file_unique_id)
             db.add(TaskAttachment(
                 task_id=task.id,assignee_id=a.id,checklist_item_id=None,uploaded_by=p.uploaded_by,
-                kind="photo",telegram_file_id=p.telegram_file_id,telegram_file_unique_id=p.telegram_file_unique_id,
+                kind="photo",media_id=p.media_id,telegram_file_id=p.telegram_file_id,telegram_file_unique_id=p.telegram_file_unique_id,
                 telegram_chat_id=p.telegram_chat_id,telegram_message_id=p.telegram_message_id,
                 file_name=None,mime_type="image/jpeg",file_size=None,label="Фото нарушения из проверки",
             ))

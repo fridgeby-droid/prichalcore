@@ -14,7 +14,10 @@ from app.core.config import APP_ENV, AUTO_SET_WEBHOOK, ENABLE_SCHEDULER, LOG_LEV
 from app.db.database import init_db, db_health
 from app.main_app import register_routers
 from app.services.telegram import set_webhook
-from app.services.telegram_webhook import handle_update
+from app.services.telegram_inbox import accept_update
+from starlette.concurrency import run_in_threadpool
+from app.services.metrics import request_metrics
+from app.services.media import start_worker, stop_worker
 from app.services.scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -30,19 +33,29 @@ async def lifespan(app:FastAPI):
     if ENABLE_SCHEDULER:
         try:start_scheduler();log.info("Scheduler started")
         except Exception as e:log.exception("Scheduler start failed: %s",e)
+    start_worker()
     yield
+    stop_worker()
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.11.6",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.12",lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
 async def performance_headers(request: Request, call_next):
     started = time.perf_counter()
-    response = await call_next(request)
+    metrics={"sql_count":0,"sql_ms":0.0}
+    ctx=request_metrics.set(metrics)
+    try:
+        response = await call_next(request)
+    finally:
+        request_metrics.reset(ctx)
+    response.headers["X-DB-Acquire-ms"]=f'{metrics.get("db_acquire_ms",0):.1f}'
+    response.headers["X-SQL-Count"]=str(metrics["sql_count"])
+    response.headers["X-SQL-Time-ms"]=f'{metrics["sql_ms"]:.1f}'
     elapsed_ms = (time.perf_counter() - started) * 1000
     response.headers["X-Process-Time-ms"] = f"{elapsed_ms:.1f}"
-    if request.url.path.startswith("/static/app.1.7.11."):
+    if request.url.path.startswith(("/static/app.1.7.12.","/static/media.1.7.12.")):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     if request.url.path.startswith("/api/") and elapsed_ms >= 150:
         log.info("Slow API %.1f ms %s %s", elapsed_ms, request.method, request.url.path)
@@ -52,10 +65,10 @@ register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.11.6","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.12","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.11.6","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.12","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():
@@ -75,8 +88,7 @@ async def telegram_webhook(request:Request,x_telegram_bot_api_secret_token:str|N
     if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token!=TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(403,"Invalid webhook secret")
     update=await request.json()
-    try:handle_update(update)
-    except Exception:log.exception("Telegram update failed")
+    await run_in_threadpool(accept_update,update)
     return {"ok":True}
 
 if __name__=="__main__":

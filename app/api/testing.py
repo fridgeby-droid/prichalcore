@@ -30,7 +30,7 @@ from app.db.models import (
     User, RoleDefinition,
 )
 from app.services.telegram import file_download_url, get_file_path
-from app.services.storage import media_download_url
+from app.services.storage import media_download_url, s3_photo_response
 from app.services.notifications import notify_test_assignment
 
 router = APIRouter(prefix="/api/testing", tags=["testing"])
@@ -73,7 +73,7 @@ def _question_dict(db: Session, q: TrainingQuestion, include_key: bool = False) 
         "question_type": q.question_type,
         "sort_order": q.sort_order,
         "active": q.active,
-        "has_image": bool(q.image_telegram_file_id),
+        "has_image": bool(q.media_id or q.image_telegram_file_id),
         "options": [_option_dict(x, include_key) for x in opts],
     }
     if include_key:
@@ -208,7 +208,7 @@ def _attempt_payload(db: Session, attempt: TrainingAttempt, include_answers: boo
             "id": q.id,
             "text": q.text,
             "question_type": q.question_type,
-            "has_image": bool(q.image_telegram_file_id),
+            "has_image": bool(q.media_id or q.image_telegram_file_id),
             "options": [_option_dict(x, False) for x in ordered],
             "answer": ({"selected_option_ids": ans.selected_option_ids_json or [], "text_answer": ans.text_answer or ""} if ans else {"selected_option_ids": [], "text_answer": ""}) if include_answers else None,
         })
@@ -393,7 +393,7 @@ def get_test(test_id: int, user=Depends(get_current_user), db: Session = Depends
 def update_test(test_id: int, payload: TestIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"testing.create","edit")
     if payload.status=="published": require_access(db,user,"testing.publish","edit")
-    test = db.get(TrainingTest, test_id)
+    test = db.get(TrainingTest,test_id,with_for_update=True,populate_existing=True)
     if not test:
         raise HTTPException(404, "Тест не найден")
     if payload.status not in TEST_STATUSES:
@@ -410,7 +410,7 @@ def update_test(test_id: int, payload: TestIn, user=Depends(get_current_user), d
 @router.delete("/tests/{test_id}")
 def archive_test(test_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"testing.create","edit")
-    test = db.get(TrainingTest, test_id)
+    test = db.get(TrainingTest,test_id,with_for_update=True,populate_existing=True)
     if not test:
         raise HTTPException(404, "Тест не найден")
     test.status = "archived"; db.commit()
@@ -420,7 +420,7 @@ def archive_test(test_id: int, user=Depends(get_current_user), db: Session = Dep
 @router.post("/tests/{test_id}/questions")
 def add_question(test_id: int, payload: QuestionIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"testing.questions","edit")
-    test = db.get(TrainingTest, test_id)
+    test = db.get(TrainingTest,test_id,with_for_update=True,populate_existing=True)
     if not test:
         raise HTTPException(404, "Тест не найден")
     _validate_question(payload)
@@ -449,7 +449,7 @@ def _validate_question(payload: QuestionIn):
 @router.patch("/questions/{question_id}")
 def update_question(question_id: int, payload: QuestionIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"testing.questions","edit")
-    q = db.get(TrainingQuestion, question_id)
+    q = db.get(TrainingQuestion,question_id,with_for_update=True,populate_existing=True)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
     _validate_question(payload)
@@ -466,7 +466,7 @@ def update_question(question_id: int, payload: QuestionIn, user=Depends(get_curr
 @router.delete("/questions/{question_id}")
 def delete_question(question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"testing.questions","edit")
-    q = db.get(TrainingQuestion, question_id)
+    q = db.get(TrainingQuestion,question_id,with_for_update=True,populate_existing=True)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
     used = db.scalar(select(TrainingAttemptAnswer.id).where(TrainingAttemptAnswer.question_id == q.id).limit(1))
@@ -480,29 +480,26 @@ def delete_question(question_id: int, user=Depends(get_current_user), db: Sessio
 
 @router.post("/questions/{question_id}/photo-request")
 def question_photo_request(question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    require_access(db,user,"testing.questions","edit")
-    q = db.get(TrainingQuestion, question_id)
-    if not q:
-        raise HTTPException(404, "Вопрос не найден")
-    req = TrainingQuestionMediaRequest(question_id=q.id, user_id=user.id, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(req); db.commit(); db.refresh(req)
-    return {"ok": True, "request_id": req.id, "message": "Отправьте фото в чат с ботом"}
+    raise HTTPException(410,"Фото добавляются прямо в Mini App. Обновите приложение")
 
 
 @router.delete("/questions/{question_id}/photo")
 def delete_question_photo(question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"testing.questions","edit")
-    q = db.get(TrainingQuestion, question_id)
+    q = db.get(TrainingQuestion,question_id)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
+    from app.services.media import authorize
+    q=authorize(db,user,"test_question",question_id)
+    q.media_id=None
     q.image_telegram_file_id = None; q.image_telegram_file_unique_id = None; q.image_mime_type = None
     db.commit(); return {"ok": True}
 
 
 @router.get("/questions/{question_id}/image")
-def question_image(question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def question_image(*, thumbnail: bool = False, question_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     q = db.get(TrainingQuestion, question_id)
-    if not q or not q.image_telegram_file_id:
+    if not q or not (q.media_id or q.image_telegram_file_id):
         raise HTTPException(404, "Изображение не найдено")
     if not has_access(db,user,"testing.questions"):
         require_access(db,user,"testing.take")
@@ -510,19 +507,13 @@ def question_image(question_id: int, user=Depends(get_current_user), db: Session
         active = _active_attempt_for_employee(db, employee.id) if employee else None
         if not active or question_id not in {int(x) for x in (active.question_order_json or [])}:
             raise HTTPException(403, "Изображение доступно только в активном тесте")
-    try:
-        url = media_download_url(db, q.image_telegram_file_id)
-        with httpx.Client(timeout=60) as client:
-            r = client.get(url); r.raise_for_status()
-            return Response(content=r.content, media_type=q.image_mime_type or "image/jpeg", headers={"Cache-Control": "private, max-age=300"})
-    except Exception as e:
-        raise HTTPException(502, f"Не удалось получить фото из Telegram: {e}")
+    return s3_photo_response(db,q.image_telegram_file_id,media_id=q.media_id,thumbnail=thumbnail,media_type=q.image_mime_type)
 
 
 @router.post("/tests/{test_id}/assign")
 def assign_test(test_id: int, payload: AssignmentIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"testing.assign","edit")
-    test = db.get(TrainingTest, test_id)
+    test = db.get(TrainingTest,test_id,with_for_update=True,populate_existing=True)
     if not test:
         raise HTTPException(404, "Тест не найден")
     ids=set(payload.employee_ids)
@@ -594,7 +585,7 @@ def allow_retry(assignment_id: int, user=Depends(get_current_user), db: Session 
     a = db.get(TrainingAssignment, assignment_id)
     if not a:
         raise HTTPException(404, "Назначение не найдено")
-    test = db.get(TrainingTest, a.test_id)
+    test = db.get(TrainingTest,a.test_id,with_for_update=True,populate_existing=True)
     used = _attempt_count(db, a.id)
     if not test or used >= test.attempts_allowed:
         raise HTTPException(400, "Лимит попыток исчерпан")
@@ -622,7 +613,7 @@ def start_attempt(assignment_id: int, user=Depends(get_current_user), db: Sessio
         if active.assignment_id == a.id:
             return _attempt_payload(db, active)
         raise HTTPException(409, "Сначала завершите уже начатый тест")
-    test = db.get(TrainingTest, a.test_id)
+    test = db.get(TrainingTest,a.test_id,with_for_update=True,populate_existing=True)
     if not test or test.status != "published":
         raise HTTPException(400, "Тест недоступен")
     _refresh_assignment(db, a)
@@ -686,7 +677,7 @@ def save_answer(attempt_id: int, question_id: int, payload: AnswerIn, user=Depen
     qids = {int(x) for x in (attempt.question_order_json or [])}
     if question_id not in qids:
         raise HTTPException(400, "Вопрос не входит в эту попытку")
-    q = db.get(TrainingQuestion, question_id)
+    q = db.get(TrainingQuestion,question_id,with_for_update=True,populate_existing=True)
     if not q:
         raise HTTPException(404, "Вопрос не найден")
     selected = [int(x) for x in payload.selected_option_ids]

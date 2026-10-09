@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
+from app.services.batching import preload, grouped
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 import httpx
@@ -18,7 +19,7 @@ from app.core.permissions import (
 from app.db.database import get_db
 from app.services.notifications import notify_task_assignees
 from app.services.telegram import get_file_path, file_download_url, send_message
-from app.services.storage import media_download_url
+from app.services.storage import s3_photo_response, media_download_url
 from app.db.models import (
     Employee, EmployeeStore, Store, TaskV2, TaskTarget, TaskAssignee,
     TaskChecklistItem, TaskChecklistProgress, TaskComment, TaskHistory,
@@ -182,15 +183,16 @@ def _scoped_task_ids(db: Session, user: User, permission_key: str) -> set[int] |
 
 def assignee_payload(db: Session, a: TaskAssignee):
     checklist = []
-    items = db.scalars(select(TaskChecklistItem).where(TaskChecklistItem.task_id == a.task_id).order_by(TaskChecklistItem.sort_order, TaskChecklistItem.id)).all()
-    progress = {p.checklist_item_id: p for p in db.scalars(select(TaskChecklistProgress).where(TaskChecklistProgress.assignee_id == a.id)).all()}
+    batch=db.info.get("task_detail_batch")
+    items = batch[0] if batch else db.scalars(select(TaskChecklistItem).where(TaskChecklistItem.task_id == a.task_id).order_by(TaskChecklistItem.sort_order, TaskChecklistItem.id)).all()
+    progress = {p.checklist_item_id: p for p in (batch[1].get(a.id,[]) if batch else db.scalars(select(TaskChecklistProgress).where(TaskChecklistProgress.assignee_id == a.id)).all())}
     for item in items:
         p = progress.get(item.id)
         checklist.append({
             "id": item.id, "text": item.text, "require_photo": item.require_photo,
             "done": bool(p and p.done), "comment": p.comment if p else None,
         })
-    attachments = db.scalars(select(TaskAttachment).where(TaskAttachment.assignee_id == a.id).order_by(TaskAttachment.created_at)).all()
+    attachments = batch[2].get(a.id,[]) if batch else db.scalars(select(TaskAttachment).where(TaskAttachment.assignee_id == a.id).order_by(TaskAttachment.created_at)).all()
     return {
         "id": a.id,
         "employee_id": a.employee_id,
@@ -208,8 +210,9 @@ def assignee_payload(db: Session, a: TaskAssignee):
 
 
 def task_payload(db: Session, t: TaskV2, include_detail: bool = False):
-    targets = db.scalars(select(TaskTarget).where(TaskTarget.task_id == t.id)).all()
-    assignees = db.scalars(select(TaskAssignee).where(TaskAssignee.task_id == t.id).order_by(TaskAssignee.id)).all()
+    batch=db.info.get("task_list_batch")
+    targets = batch[0].get(t.id,[]) if batch is not None else db.scalars(select(TaskTarget).where(TaskTarget.task_id == t.id)).all()
+    assignees = batch[1].get(t.id,[]) if batch is not None else db.scalars(select(TaskAssignee).where(TaskAssignee.task_id == t.id).order_by(TaskAssignee.id)).all()
     status_counts: dict[str, int] = {}
     for a in assignees:
         status_counts[a.status] = status_counts.get(a.status, 0) + 1
@@ -233,6 +236,9 @@ def task_payload(db: Session, t: TaskV2, include_detail: bool = False):
         "targets": [{"type": x.target_type, "employee_id": x.employee_id, "employee_name": employee_name(db,x.employee_id), "store_id": x.store_id, "store_name": store_name(db,x.store_id)} for x in targets],
     }
     if include_detail:
+        aids=[a.id for a in assignees]
+        db.info["task_detail_batch"]=(list(db.scalars(select(TaskChecklistItem).where(TaskChecklistItem.task_id==t.id).order_by(TaskChecklistItem.sort_order,TaskChecklistItem.id)).all()),grouped(db,TaskChecklistProgress,TaskChecklistProgress.assignee_id,aids),grouped(db,TaskAttachment,TaskAttachment.assignee_id,aids,TaskAttachment.created_at))
+        preload(db,Employee,[a.employee_id for a in assignees]);preload(db,Store,[a.source_store_id for a in assignees])
         payload["assignees"] = [assignee_payload(db, a) for a in assignees]
         payload["comments"] = [{
             "id": c.id, "user_id": c.user_id, "user_name": name_user(db,c.user_id), "assignee_id": c.assignee_id,
@@ -344,6 +350,7 @@ def list_tasks(
     scope: str = "my", status: str | None = None, priority: str | None = None,
     store_id: int | None = None, employee_id: int | None = None, creator_id: int | None = None,
     deadline_from: datetime | None = None, deadline_to: datetime | None = None,
+    limit: int = 50, offset: int = 0,
     user=Depends(get_current_user), db: Session = Depends(get_db)
 ):
     emp = current_employee(db, user)
@@ -361,7 +368,7 @@ def list_tasks(
         if allowed_ids is not None:
             q = q.where(TaskV2.id.in_(list(allowed_ids) or [-1]))
         if status:
-            q = q.join(TaskAssignee, TaskAssignee.task_id == TaskV2.id).where(TaskAssignee.status == status)
+            q = q.where(select(TaskAssignee.id).where(TaskAssignee.task_id==TaskV2.id,TaskAssignee.status==status).exists())
     elif scope == "history":
         require_access(db, user, "tasks.history")
         allowed_ids = _scoped_task_ids(db, user, "tasks.history")
@@ -386,13 +393,19 @@ def list_tasks(
         if scope != "my":
             assert_store_scope(db, user, key, store_id)
         q = q.join(TaskTarget, TaskTarget.task_id == TaskV2.id).where(TaskTarget.store_id == store_id)
-    q = q.distinct().order_by(TaskV2.deadline.asc().nullslast(), TaskV2.created_at.desc()).limit(500)
-    return [task_payload(db, t, False) for t in db.scalars(q).unique().all()]
+    q = q.distinct().order_by(TaskV2.deadline.asc().nullslast(), TaskV2.created_at.desc(),TaskV2.id.desc()).limit(max(1,min(limit,100))).offset(max(0,offset))
+    rows=list(db.scalars(q).unique().all());ids=[t.id for t in rows]
+    targets=grouped(db,TaskTarget,TaskTarget.task_id,ids)
+    assignees=grouped(db,TaskAssignee,TaskAssignee.task_id,ids,TaskAssignee.id)
+    all_targets=[x for group in targets.values() for x in group]
+    preload(db,User,[t.created_by for t in rows]);preload(db,Employee,[x.employee_id for x in all_targets]);preload(db,Store,[x.store_id for x in all_targets])
+    db.info["task_list_batch"]=(targets,assignees)
+    return [task_payload(db, t, False) for t in rows]
 
 
 @router.patch("/{task_id}")
 def edit_task(task_id:int,payload:dict,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    t=db.get(TaskV2,task_id)
+    t=db.get(TaskV2,task_id,with_for_update=True,populate_existing=True)
     if not t: raise HTTPException(404,"Задача не найдена")
     require_access(db, user, "tasks.edit_before_start", "edit")
     if not _task_in_permission_scope(db, t, user, "tasks.edit_before_start", "edit"):
@@ -465,7 +478,7 @@ def get_task(task_id: int, user=Depends(get_current_user), db: Session = Depends
 
 @router.patch("/{task_id}/assignees/{assignee_id}/status")
 def change_assignee_status(task_id: int, assignee_id: int, payload: dict, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    t = db.get(TaskV2, task_id); a = db.get(TaskAssignee, assignee_id)
+    t = db.get(TaskV2,task_id,with_for_update=True,populate_existing=True); a = db.get(TaskAssignee,assignee_id,with_for_update=True,populate_existing=True)
     if not t or not a or a.task_id != t.id: raise HTTPException(404, "Исполнение задачи не найдено")
     emp = current_employee(db, user)
     is_assignee = bool(emp and a.employee_id == emp.id)
@@ -535,7 +548,7 @@ def maybe_create_next_recurrence(db: Session, t: TaskV2, user_id: int):
 
 @router.post("/{task_id}/assignees/{assignee_id}/review")
 def review(task_id: int, assignee_id: int, payload: ReviewIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    t = db.get(TaskV2, task_id); a = db.get(TaskAssignee, assignee_id)
+    t = db.get(TaskV2,task_id,with_for_update=True,populate_existing=True); a = db.get(TaskAssignee,assignee_id,with_for_update=True,populate_existing=True)
     if not t or not a or a.task_id != t.id: raise HTTPException(404, "Исполнение задачи не найдено")
     if payload.decision not in {"done","rejected"}: raise HTTPException(400,"Решение должно быть done/rejected")
     permission_key = "tasks.accept" if payload.decision == "done" else "tasks.reject"
@@ -555,7 +568,7 @@ def review(task_id: int, assignee_id: int, payload: ReviewIn, user=Depends(get_c
 
 @router.patch("/{task_id}/assignees/{assignee_id}/checklist/{item_id}")
 def checklist(task_id:int, assignee_id:int, item_id:int, payload:dict, user=Depends(get_current_user), db:Session=Depends(get_db)):
-    t=db.get(TaskV2,task_id); a=db.get(TaskAssignee,assignee_id); item=db.get(TaskChecklistItem,item_id)
+    t=db.get(TaskV2,task_id,with_for_update=True,populate_existing=True); a=db.get(TaskAssignee,assignee_id,with_for_update=True,populate_existing=True); item=db.get(TaskChecklistItem,item_id)
     if not t or not a or not item or a.task_id!=t.id or item.task_id!=t.id: raise HTTPException(404,"Пункт не найден")
     require_access(db,user,"tasks.my","edit")
     emp=current_employee(db,user)
@@ -572,7 +585,7 @@ def checklist(task_id:int, assignee_id:int, item_id:int, payload:dict, user=Depe
 
 @router.post("/{task_id}/comments")
 def comment(task_id:int,payload:CommentIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    t=db.get(TaskV2,task_id)
+    t=db.get(TaskV2,task_id,with_for_update=True,populate_existing=True)
     if not t or not task_accessible(db,t,user):raise HTTPException(404,"Задача не найдена")
     me=current_employee(db,user)
     own_assignee=bool(me and db.scalar(select(TaskAssignee.id).where(TaskAssignee.task_id==t.id,TaskAssignee.employee_id==me.id).limit(1)))
@@ -588,7 +601,8 @@ def comment(task_id:int,payload:CommentIn,user=Depends(get_current_user),db:Sess
 
 @router.post("/{task_id}/attachments/request")
 def attachment_request(task_id:int,payload:AttachmentRequestIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    t=db.get(TaskV2,task_id);a=db.get(TaskAssignee,payload.assignee_id)
+    if payload.kind=="photo":raise HTTPException(410,"Фото добавляются прямо в Mini App")
+    t=db.get(TaskV2,task_id,with_for_update=True,populate_existing=True);a=db.get(TaskAssignee,payload.assignee_id,with_for_update=True,populate_existing=True)
     if not t or not a or a.task_id!=t.id:raise HTTPException(404,"Задача не найдена")
     require_access(db,user,"tasks.my","edit")
     emp=current_employee(db,user)
@@ -606,9 +620,16 @@ def attachment_request(task_id:int,payload:AttachmentRequestIn,user=Depends(get_
 
 
 @router.get("/{task_id}/attachments/{attachment_id}/content")
-def attachment_content(task_id:int,attachment_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
+def attachment_content(*, thumbnail: bool = False, task_id:int,attachment_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
     t=db.get(TaskV2,task_id);a=db.get(TaskAttachment,attachment_id)
     if not t or not a or a.task_id!=t.id or not task_accessible(db,t,user): raise HTTPException(404,"Файл не найден")
+    can_control=has_access(db,user,"tasks.control") and _task_in_permission_scope(db,t,user,"tasks.control")
+    can_history=has_access(db,user,"tasks.history") and _task_in_permission_scope(db,t,user,"tasks.history")
+    if not (can_control or can_history):
+        owner=db.get(TaskAssignee,a.assignee_id);employee=current_employee(db,user)
+        if not owner or not employee or owner.employee_id!=employee.id:raise HTTPException(404,"Файл не найден")
+    if a.kind=="photo":
+        return s3_photo_response(db,a.telegram_file_id,media_id=a.media_id,thumbnail=thumbnail,media_type=a.mime_type)
     url=media_download_url(db,a.telegram_file_id)
     client=httpx.Client(timeout=30); response=client.stream("GET",url); response.__enter__()
     if response.status_code!=200:
@@ -625,7 +646,7 @@ def attachment_content(task_id:int,attachment_id:int,user=Depends(get_current_us
 
 @router.post("/{task_id}/cancel")
 def cancel(task_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    t=db.get(TaskV2,task_id)
+    t=db.get(TaskV2,task_id,with_for_update=True,populate_existing=True)
     if not t:raise HTTPException(404,"Задача не найдена")
     require_access(db,user,"tasks.cancel","edit")
     if not _task_in_permission_scope(db,t,user,"tasks.cancel","edit"):raise HTTPException(403,"Нет доступа")

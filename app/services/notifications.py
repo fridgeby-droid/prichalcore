@@ -101,31 +101,7 @@ def notify_employee(
     reply_markup: dict | None = None,
     use_default_button: bool = True,
 ) -> TelegramDeliveryLog | None:
-    employee = db.get(Employee, employee_id)
-    if not employee or not employee.active or not employee.telegram_id:
-        return None
-    if not _pref_enabled(db, employee.id, event_type):
-        return None
-    dedupe_key = f"personal:{event_type}:{entity_type}:{entity_id}:{employee.id}{dedupe_suffix}"
-    if _existing(db, dedupe_key):
-        return None
-    try:
-        if reply_markup is None and use_default_button:
-            reply_markup = _default_markup()
-        data = send_message(int(employee.telegram_id), text, reply_markup)
-        return _save_log(
-            db, event_type=event_type, entity_type=entity_type, entity_id=entity_id,
-            chat_id=int(employee.telegram_id), dedupe_key=dedupe_key, status="sent",
-            recipient_employee_id=employee.id, telegram_message_id=_message_id(data),
-            payload={"text": text, "reply_markup": reply_markup},
-        )
-    except Exception as exc:
-        return _save_log(
-            db, event_type=event_type, entity_type=entity_type, entity_id=entity_id,
-            chat_id=int(employee.telegram_id), dedupe_key=dedupe_key, status="error",
-            recipient_employee_id=employee.id, error=str(exc)[:2000],
-            payload={"text": text, "reply_markup": reply_markup},
-        )
+    return queue_employee(db,employee_id=employee_id,event_type=event_type,entity_type=entity_type,entity_id=entity_id,text=text,dedupe_suffix=dedupe_suffix,reply_markup=reply_markup,use_default_button=use_default_button)
 
 
 def queue_employee(
@@ -157,27 +133,6 @@ def queue_employee(
     )
 
 
-def process_pending_personal_deliveries(db: Session, limit: int = 25) -> int:
-    rows = list(db.scalars(
-        select(TelegramDeliveryLog)
-        .where(TelegramDeliveryLog.status == "pending", TelegramDeliveryLog.recipient_employee_id.is_not(None))
-        .order_by(TelegramDeliveryLog.created_at)
-        .limit(limit)
-    ).all())
-    processed = 0
-    for log in rows:
-        payload = log.payload_json or {}
-        try:
-            data = send_message(int(log.chat_id), str(payload.get("text") or ""), payload.get("reply_markup"))
-            log.status = "sent"
-            log.telegram_message_id = _message_id(data)
-            log.sent_at = datetime.utcnow()
-            log.error = None
-        except Exception as exc:
-            log.status = "error"
-            log.error = str(exc)[:2000]
-        processed += 1
-    return processed
 
 
 def _route(db: Session, event_type: str, target_type: str, target_id: int):
@@ -220,46 +175,8 @@ def _send_group(
     if existing and not force:
         return {"status": existing.status, "log_id": existing.id, "message_id": existing.telegram_message_id, "duplicate": True}
 
-    photo_files = list(photos) if send_media else []
-    photo_ids: list[int | None] = []
-    main_message_id: int | None = None
-    try:
-        def deliver_photos():
-            for file_id in photo_files:
-                try:
-                    pdata = send_photo(int(destination.chat_id), file_id, photo_caption or None)
-                    photo_ids.append(_message_id(pdata))
-                except Exception:
-                    photo_ids.append(None)
-
-        if media_order == "media_first":
-            deliver_photos()
-            data = send_message(int(destination.chat_id), text, reply_markup)
-            main_message_id = _message_id(data)
-        else:
-            data = send_message(int(destination.chat_id), text, reply_markup)
-            main_message_id = _message_id(data)
-            deliver_photos()
-
-        log = _save_log(
-            db, event_type=event_type, entity_type=entity_type, entity_id=entity_id,
-            destination_id=destination.id, chat_id=int(destination.chat_id), dedupe_key=dedupe_key,
-            status="sent", telegram_message_id=main_message_id,
-            payload={
-                "text": text, "reply_markup": reply_markup, "photo_message_ids": photo_ids,
-                "target_type": target_type, "target_id": target_id,
-                "media_order": media_order, "photo_caption": photo_caption,
-            },
-        )
-        return {"status": "sent", "log_id": log.id, "message_id": main_message_id}
-    except Exception as exc:
-        log = _save_log(
-            db, event_type=event_type, entity_type=entity_type, entity_id=entity_id,
-            destination_id=destination.id, chat_id=int(destination.chat_id), dedupe_key=dedupe_key,
-            status="error", error=str(exc)[:2000],
-            payload={"text": text, "reply_markup": reply_markup, "target_type": target_type, "target_id": target_id},
-        )
-        return {"status": "error", "log_id": log.id, "error": str(exc)}
+    entry=_save_log(db,event_type=event_type,entity_type=entity_type,entity_id=entity_id,destination_id=destination.id,chat_id=int(destination.chat_id),dedupe_key=dedupe_key,status="pending",payload={"text":text,"reply_markup":reply_markup,"photos":list(photos) if send_media else [],"media_order":media_order,"photo_caption":photo_caption,"target_type":target_type,"target_id":target_id})
+    return {"status":"pending","log_id":entry.id,"message_id":None}
 
 
 def _user_name(user: User | None) -> str:
@@ -369,7 +286,7 @@ def _handover_photo_file_ids(db: Session, report_id: int) -> list[str]:
     value_ids = list(db.scalars(select(ShiftReportValue.id).where(ShiftReportValue.report_id == report_id)).all())
     if not value_ids:
         return []
-    return list(db.scalars(select(Photo.telegram_file_id).where(Photo.entity_type == "shift_report_field", Photo.entity_id.in_(value_ids)).order_by(Photo.created_at)).all())
+    return [{"media_id":p.media_id,"telegram_file_id":p.telegram_file_id} for p in db.scalars(select(Photo).where(Photo.entity_type == "shift_report_field", Photo.entity_id.in_(value_ids)).order_by(Photo.created_at)).all()]
 
 
 def send_handover_accepted(db: Session, report_id: int, force: bool = False) -> dict:

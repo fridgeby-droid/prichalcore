@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from app.services.batching import preload
 from sqlalchemy.orm import Session
 from app.services.notifications import send_handover_accepted
 
@@ -80,7 +81,7 @@ def _kind_aliases(shift_type: str) -> list[str]:
 
 def _template_for_assignment(db: Session, assignment: WorkShiftAssignment) -> ShiftTemplate | None:
     aliases = _kind_aliases(assignment.shift_type)
-    templates = list(db.scalars(
+    templates = ([t for t in db.info["assignment_templates"] if t.store_id==assignment.store_id and t.shift_kind in aliases] if "assignment_templates" in db.info else list(db.scalars(
         select(ShiftTemplate)
         .where(
             ShiftTemplate.store_id == assignment.store_id,
@@ -88,7 +89,7 @@ def _template_for_assignment(db: Session, assignment: WorkShiftAssignment) -> Sh
             ShiftTemplate.shift_kind.in_(aliases),
         )
         .order_by(ShiftTemplate.id.desc())
-    ).all())
+    ).all()))
     if not templates:
         return None
     exact = [t for t in templates if t.shift_kind == assignment.shift_type]
@@ -105,16 +106,27 @@ def _field_options(field: ShiftTemplateField) -> dict[str, Any]:
 
 
 def _report_values(db: Session, report_id: int):
+    cached=db.info.get("shift_values",{})
+    if report_id in cached: return cached[report_id]
     rows = db.execute(
         select(ShiftReportValue, ShiftTemplateField)
         .join(ShiftTemplateField, ShiftTemplateField.id == ShiftReportValue.field_id)
         .where(ShiftReportValue.report_id == report_id)
         .order_by(ShiftTemplateField.sort_order, ShiftTemplateField.id)
     ).all()
+    ids=[v.id for v,f in rows]
+    cache=db.info.setdefault("shift_photos",{})
+    missing=[i for i in ids if i not in cache]
+    if missing:
+        for i in missing: cache[i]=[]
+        for p in db.scalars(select(Photo).where(Photo.entity_type=="shift_report_field",Photo.entity_id.in_(missing)).order_by(Photo.created_at)).all(): cache[p.entity_id].append(p)
+    db.info.setdefault("shift_values",{})[report_id]=rows
     return rows
 
 
 def _photo_count(db: Session, value_id: int) -> int:
+    cached=db.info.get("shift_photos",{})
+    if value_id in cached: return len(cached[value_id])
     return len(list(db.scalars(select(Photo.id).where(Photo.entity_type == "shift_report_field", Photo.entity_id == value_id)).all()))
 
 
@@ -189,6 +201,31 @@ def _due_state(assignment: WorkShiftAssignment) -> str:
     return "late"
 
 
+def _prime_reports(db, reports):
+    reports=list(reports)
+    ids=[r.id for r in reports]
+    preload(db,Store,[r.store_id for r in reports]);preload(db,Employee,[r.employee_id for r in reports])
+    preload(db,User,[uid for r in reports for uid in (r.submitted_by,r.reviewed_by)])
+    values={i:[] for i in ids}
+    for v,f in db.execute(select(ShiftReportValue,ShiftTemplateField).join(ShiftTemplateField,ShiftTemplateField.id==ShiftReportValue.field_id).where(ShiftReportValue.report_id.in_(ids)).order_by(ShiftTemplateField.sort_order,ShiftTemplateField.id)).all():values[v.report_id].append((v,f))
+    db.info.setdefault("shift_values",{}).update(values)
+    value_ids=[v.id for group in values.values() for v,f in group]
+    photos={i:[] for i in value_ids}
+    for p in db.scalars(select(Photo).where(Photo.entity_type=="shift_report_field",Photo.entity_id.in_(value_ids)).order_by(Photo.created_at)).all():photos[p.entity_id].append(p)
+    db.info.setdefault("shift_photos",{}).update(photos)
+    return reports
+
+
+def _prime_assignments(db,assignments):
+    preload(db,Store,[a.store_id for a in assignments]);preload(db,Employee,[a.employee_id for a in assignments])
+    reports=list(db.scalars(select(ShiftReport).where(ShiftReport.work_assignment_id.in_([a.id for a in assignments])).order_by(ShiftReport.id.desc())).all())
+    _prime_reports(db,reports)
+    report_map={}
+    for report in reports:report_map.setdefault(report.work_assignment_id,report)
+    db.info['assignment_reports']=report_map
+    db.info['assignment_templates']=list(db.scalars(select(ShiftTemplate).where(ShiftTemplate.store_id.in_([a.store_id for a in assignments]),ShiftTemplate.active.is_(True)).order_by(ShiftTemplate.id.desc())).all())
+
+
 def _report_brief(db: Session, report: ShiftReport) -> dict[str, Any]:
     store = db.get(Store, report.store_id)
     employee = db.get(Employee, report.employee_id) if report.employee_id else None
@@ -226,11 +263,7 @@ def _report_detail(db: Session, report: ShiftReport) -> dict[str, Any]:
         remarks_by_field.setdefault(remark.field_id, []).append(remark.remark)
     for value_row, field in _report_values(db, report.id):
         opts = _field_options(field)
-        photos = list(db.scalars(
-            select(Photo)
-            .where(Photo.entity_type == "shift_report_field", Photo.entity_id == value_row.id)
-            .order_by(Photo.created_at)
-        ).all())
+        photos = db.info["shift_photos"].get(value_row.id,[])
         values.append({
             "value_id": value_row.id,
             "field_id": field.id,
@@ -292,10 +325,11 @@ def mine(
         )
         .order_by(WorkShiftAssignment.work_date.desc(), WorkShiftAssignment.shift_type)
     ).all())
+    _prime_assignments(db,assignments)
     items = []
     for assignment in assignments:
         store = db.get(Store, assignment.store_id)
-        report = db.scalar(select(ShiftReport).where(ShiftReport.work_assignment_id == assignment.id).order_by(ShiftReport.id.desc()))
+        report = db.info["assignment_reports"].get(assignment.id)
         template = _template_for_assignment(db, assignment)
         items.append({
             "assignment_id": assignment.id,
@@ -369,7 +403,7 @@ def report_detail(report_id: int, user=Depends(get_current_user), db: Session = 
 @router.patch("/reports/{report_id}/draft")
 def save_draft(report_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"shifts.submit","edit")
-    report = db.get(ShiftReport, report_id)
+    report = db.get(ShiftReport,report_id,with_for_update=True,populate_existing=True)
     if not report:
         raise HTTPException(404, "Пересменка не найдена")
     if report.submitted_by != user.id:
@@ -385,13 +419,14 @@ def save_draft(report_id: int, payload: dict[str, Any], user=Depends(get_current
         if key in values:
             value_row.value_json = values[key]
     db.commit()
+    db.info.pop("shift_values",None);db.info.pop("shift_photos",None)
     return _report_detail(db, report)
 
 
 @router.post("/reports/{report_id}/submit")
 def submit_report(report_id: int, payload: dict[str, Any] | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"shifts.submit","edit")
-    report = db.get(ShiftReport, report_id)
+    report = db.get(ShiftReport,report_id,with_for_update=True,populate_existing=True)
     if not report:
         raise HTTPException(404, "Пересменка не найдена")
     if report.submitted_by != user.id:
@@ -400,7 +435,7 @@ def submit_report(report_id: int, payload: dict[str, Any] | None = None, user=De
         raise HTTPException(400, "Пересменка уже отправлена на проверку")
     if payload and payload.get("values"):
         save_draft(report_id, payload, user, db)
-        report = db.get(ShiftReport, report_id)
+        report = db.get(ShiftReport,report_id,with_for_update=True,populate_existing=True)
     issues = _issues_for_report(db, report)
     missing = [x for x in issues if x["detail"] in {"Поле не заполнено", "Нет обязательного фото"}]
     if missing:
@@ -424,6 +459,7 @@ def submit_report(report_id: int, payload: dict[str, Any] | None = None, user=De
         snapshot_json=_snapshot(db, report),
     ))
     db.commit()
+    db.info.pop("shift_values",None);db.info.pop("shift_photos",None)
     return _report_detail(db, report)
 
 
@@ -453,6 +489,7 @@ def control(
         )
         .order_by(WorkShiftAssignment.store_id, WorkShiftAssignment.work_date, WorkShiftAssignment.shift_type, WorkShiftAssignment.slot)
     ).all())
+    _prime_assignments(db,assignments)
     items = []
     for assignment in assignments:
         is_due_date = (assignment.shift_type == "day" and assignment.work_date == target) or (assignment.shift_type == "night" and assignment.work_date + timedelta(days=1) == target)
@@ -460,7 +497,7 @@ def control(
             continue
         store = db.get(Store, assignment.store_id)
         employee = db.get(Employee, assignment.employee_id) if assignment.employee_id else None
-        report = db.scalar(select(ShiftReport).where(ShiftReport.work_assignment_id == assignment.id).order_by(ShiftReport.id.desc()))
+        report = db.info["assignment_reports"].get(assignment.id)
         effective_status = report.status if report else ("missing" if _due_state(assignment) == "late" else "expected")
         if status and effective_status != status:
             continue
@@ -503,7 +540,7 @@ class ReviewIn(BaseModel):
 def review_report(report_id: int, payload: ReviewIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     if payload.decision not in REVIEW_DECISIONS:
         raise HTTPException(400, "Неизвестное решение")
-    report = db.get(ShiftReport, report_id)
+    report = db.get(ShiftReport,report_id,with_for_update=True,populate_existing=True)
     if not report:
         raise HTTPException(404, "Пересменка не найдена")
     pk={"accepted":"shifts.accept","accepted_with_remarks":"shifts.accept_remarks","rejected":"shifts.reject"}[payload.decision]
@@ -578,7 +615,7 @@ def history(
         stmt=select(ShiftReport).where(ShiftReport.employee_id==emp.id,ShiftReport.work_date.is_not(None),ShiftReport.work_date>=start,ShiftReport.work_date<=end,ShiftReport.status!="draft")
         if store_id:stmt=stmt.where(ShiftReport.store_id==store_id)
         if status:stmt=stmt.where(ShiftReport.status==status)
-        return [_report_brief(db,r) for r in db.scalars(stmt.order_by(ShiftReport.work_date.desc(),ShiftReport.submitted_at.desc())).all()]
+        return [_report_brief(db,r) for r in _prime_reports(db,db.scalars(stmt.order_by(ShiftReport.work_date.desc(),ShiftReport.submitted_at.desc(),ShiftReport.id.desc())).all())]
     store_ids=_scope_store_ids(db,user,"shifts.history")
     if store_id:_assert_store(db,user,store_id,"shifts.history","view");store_ids=[store_id]
     if not store_ids:return []
@@ -591,7 +628,7 @@ def history(
     ).order_by(ShiftReport.work_date.desc(), ShiftReport.submitted_at.desc())
     if status:
         stmt = stmt.where(ShiftReport.status == status)
-    return [_report_brief(db, r) for r in db.scalars(stmt).all()]
+    return [_report_brief(db, r) for r in _prime_reports(db,db.scalars(stmt).all())]
 
 
 @router.get("/forms")

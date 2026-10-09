@@ -399,11 +399,12 @@ class PhotoRequest(Base):
 class Photo(Base):
     __tablename__ = "photos"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    media_id: Mapped[str | None] = mapped_column(ForeignKey("media_assets.id", ondelete="RESTRICT"), nullable=True, index=True)
     entity_type: Mapped[str] = mapped_column(String(64), index=True)
     entity_id: Mapped[int] = mapped_column(Integer, index=True)
     store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="SET NULL"), nullable=True, index=True)
     uploaded_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
-    telegram_file_id: Mapped[str] = mapped_column(Text)
+    telegram_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     telegram_file_unique_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -698,12 +699,13 @@ class TaskAttachmentRequest(Base):
 class TaskAttachment(Base):
     __tablename__ = "task_attachments"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    media_id: Mapped[str | None] = mapped_column(ForeignKey("media_assets.id", ondelete="RESTRICT"), nullable=True, index=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks_v2.id", ondelete="CASCADE"), index=True)
     assignee_id: Mapped[int] = mapped_column(ForeignKey("task_assignees.id", ondelete="CASCADE"), index=True)
     checklist_item_id: Mapped[int | None] = mapped_column(ForeignKey("task_checklist_items.id", ondelete="SET NULL"), nullable=True, index=True)
     uploaded_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     kind: Mapped[str] = mapped_column(String(16), index=True)
-    telegram_file_id: Mapped[str] = mapped_column(Text)
+    telegram_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     telegram_file_unique_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -777,10 +779,11 @@ class KnowledgeMediaUploadRequest(Base):
 class KnowledgeMedia(Base):
     __tablename__ = "knowledge_media"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    media_id: Mapped[str | None] = mapped_column(ForeignKey("media_assets.id", ondelete="RESTRICT"), nullable=True, index=True)
     article_id: Mapped[int] = mapped_column(ForeignKey("knowledge_articles.id", ondelete="CASCADE"), index=True)
     uploaded_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     kind: Mapped[str] = mapped_column(String(16), index=True)  # photo/video
-    telegram_file_id: Mapped[str] = mapped_column(Text)
+    telegram_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     telegram_file_unique_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -838,6 +841,7 @@ class TrainingQuestion(Base):
     explanation_internal: Mapped[str | None] = mapped_column(Text, nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    media_id: Mapped[str | None] = mapped_column(ForeignKey("media_assets.id", ondelete="RESTRICT"), nullable=True, index=True)
     image_telegram_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     image_telegram_file_unique_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     image_mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -990,3 +994,58 @@ class EmployeeNotificationPreference(Base):
 Index("ix_telegram_route_event_target", TelegramRoute.event_type, TelegramRoute.target_type, TelegramRoute.target_id)
 Index("ix_telegram_delivery_entity", TelegramDeliveryLog.entity_type, TelegramDeliveryLog.entity_id, TelegramDeliveryLog.created_at)
 Index("ix_telegram_template_event_active", TelegramMessageTemplate.event_type, TelegramMessageTemplate.active)
+
+
+class MediaAsset(Base):
+    __tablename__ = "media_assets"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    s3_key: Mapped[str] = mapped_column(Text, unique=True)
+    thumbnail_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mime_type: Mapped[str] = mapped_column(String(120), default="image/jpeg")
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    legacy_file_id: Mapped[str | None] = mapped_column(Text, nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class MediaUpload(Base):
+    __tablename__ = "media_uploads"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    request_key: Mapped[str] = mapped_column(String(64))
+    entity_type: Mapped[str] = mapped_column(String(64))
+    entity_id: Mapped[int] = mapped_column(Integer)
+    context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    temporary_key: Mapped[str] = mapped_column(Text, unique=True)
+    expected_size: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    __table_args__ = (UniqueConstraint("user_id", "request_key", name="uq_media_upload_request"),)
+
+
+class MediaAudit(Base):
+    __tablename__ = "media_audit"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    media_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    entity_type: Mapped[str] = mapped_column(String(64))
+    entity_id: Mapped[int] = mapped_column(Integer)
+    action: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class TelegramInbox(Base):
+    __tablename__ = "telegram_inbox"
+    update_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    payload_json: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)

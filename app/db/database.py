@@ -76,8 +76,10 @@ def get_engine():
                 connect_args["sslrootcert"] = ca_path
             if connect_args:
                 kwargs["connect_args"] = connect_args
-            kwargs.update({"pool_size": 5, "max_overflow": 10, "pool_recycle": 300})
+            kwargs.update({"pool_size": int(os.getenv("DB_POOL_SIZE","5")), "max_overflow": int(os.getenv("DB_MAX_OVERFLOW","10")), "pool_recycle": int(os.getenv("DB_POOL_RECYCLE","300")), "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT","30"))})
         _engine = create_engine(url, **kwargs)
+        from app.services.metrics import install
+        install(_engine)
         SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     return _engine
 
@@ -431,7 +433,7 @@ def _postgres_performance_upgrade(engine):
         for ddl in statements:
             conn.execute(text(ddl))
 
-def init_db():
+def _init_legacy():
     from app.db import models  # noqa: F401
     engine = get_engine()
     # New employee tables are created first; legacy schedule tables are preserved.
@@ -444,12 +446,40 @@ def init_db():
         _postgres_telegram_upgrade(engine)
         _postgres_admin_center_upgrade(engine)
         _postgres_performance_upgrade(engine)
+    from app.db.media_migration import upgrade
+    upgrade(engine)
     _seed_employees_from_users()
     _seed_knowledge_sections()
     _seed_telegram_message_templates()
     _seed_admin_roles()
     _backfill_schedule_employee_ids(engine)
     _backfill_handover_employee_ids(engine)
+
+
+def init_db():
+    from app.db import models
+    engine=get_engine()
+    # A version row avoids schema reflection, seed and backfill on every restart.
+    with engine.connect() as lock:
+        if engine.dialect.name=='postgresql':
+            lock.execute(text("SELECT pg_advisory_lock(714118)"));lock.commit()
+        try:
+            lock.execute(text("CREATE TABLE IF NOT EXISTS core_schema_versions (version VARCHAR(64) PRIMARY KEY)"));lock.commit()
+            done=set(lock.execute(text("SELECT version FROM core_schema_versions")).scalars());lock.commit()
+            if 'legacy-1.7.11' not in done:
+                _init_legacy()
+                lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('legacy-1.7.11')"));lock.commit()
+            if 'media-1.7.12' not in done:
+                models.MediaAsset.__table__.create(engine,checkfirst=True)
+                models.MediaUpload.__table__.create(engine,checkfirst=True)
+                models.MediaAudit.__table__.create(engine,checkfirst=True)
+                models.TelegramInbox.__table__.create(engine,checkfirst=True)
+                from app.db.media_migration import upgrade
+                upgrade(engine)
+                lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('media-1.7.12')"));lock.commit()
+        finally:
+            if engine.dialect.name=='postgresql':
+                lock.execute(text("SELECT pg_advisory_unlock(714118)"));lock.commit()
 
 
 def db_health():
@@ -519,6 +549,11 @@ def get_db():
     get_engine()
     db = SessionLocal()
     try:
+        from app.services.metrics import request_metrics
+        metrics=request_metrics.get()
+        started=time.perf_counter()
+        db.connection()
+        if metrics is not None: metrics["db_acquire_ms"]=(time.perf_counter()-started)*1000
         yield db
     finally:
         db.close()

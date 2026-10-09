@@ -1,3 +1,7 @@
+# Обновление 1.7.12
+
+Описание изменений, развёртывания и проверок: [RELEASE_1.7.12.md](RELEASE_1.7.12.md).
+
 # Причал Core v1.7.11 — Performance Optimization
 
 v1.7.11 построена поверх стабильной v1.7.10. Новых бизнес-модулей нет: версия ускоряет старт MiniApp, Главную, бейджи и типовые обращения к PostgreSQL, сохраняя матрицу прав и текущую бизнес-логику.
@@ -88,3 +92,11 @@ Slow API 243.7 ms GET /api/...
 покажут конкретные endpoint'ы, которые ещё требуют оптимизации на реальной PostgreSQL.
 
 Подробности: `PERFORMANCE.md` и `SECURITY.md`.
+
+
+### v1.7.11.7 — S3 avatar reading
+Profile avatar is streamed from private S3 directly by the backend; legacy Telegram images remain supported.
+
+
+## v1.7.11.8 — private S3 photo read paths
+All image endpoints (avatar, shifts, inspections, task attachments, training questions, knowledge photos) read S3 directly after existing authorization checks. No Telegram read fallback for images. No local photos migration. Telegram remains only the upload transport and source identifier for the `stored_objects` mapping. Other media (videos and uploaded documents) are unchanged.

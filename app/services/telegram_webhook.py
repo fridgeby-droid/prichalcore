@@ -9,6 +9,10 @@ from app.services.storage import mirror_telegram_photo_to_s3
 
 
 def handle_update(update:dict):
+    message=update.get("message") or {}
+    if message.get("photo"):
+        send_message(message["chat"]["id"],"Фото теперь добавляются прямо в Mini App: откройте нужный раздел и нажмите «Добавить фото».")
+        return
     msg=update.get("message") or {}
     chat=msg.get("chat") or {}
     tg_user=msg.get("from") or {}
@@ -78,69 +82,3 @@ def handle_update(update:dict):
             kb_req.status="done"
             send_message(tid,"✅ Видео добавлено в базу знаний. Вернитесь в статью, чтобы вставить его в текст.")
         return
-    photos=msg.get("photo") or []
-    if photos:
-        with session_scope() as db:
-            user=db.scalar(select(User).where(User.telegram_id==tid))
-            if not user:
-                send_message(tid,"Сначала откройте MiniApp и авторизуйтесь.");return
-            profile_req=db.scalar(select(PhotoRequest).where(PhotoRequest.user_id==user.id,PhotoRequest.entity_type=="profile_avatar",PhotoRequest.status=="waiting",PhotoRequest.expires_at>datetime.utcnow()).order_by(PhotoRequest.created_at.desc()))
-            if profile_req:
-                p=photos[-1]
-                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
-                db.add(Photo(entity_type="profile_avatar",entity_id=profile_req.entity_id,store_id=None,uploaded_by=user.id,telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),label="Фото профиля"))
-                profile_req.status="done"
-                send_message(tid,"✅ Фото профиля обновлено. Откройте Причал Core снова.")
-                return
-            test_req=db.scalar(select(TrainingQuestionMediaRequest).where(TrainingQuestionMediaRequest.user_id==user.id,TrainingQuestionMediaRequest.status=="waiting",TrainingQuestionMediaRequest.expires_at>datetime.utcnow()).order_by(TrainingQuestionMediaRequest.created_at.desc()))
-            if test_req:
-                q=db.get(TrainingQuestion,test_req.question_id)
-                if not q:
-                    test_req.status="expired"
-                    send_message(tid,"Вопрос теста не найден.");return
-                p=photos[-1]
-                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
-                q.image_telegram_file_id=p["file_id"]
-                q.image_telegram_file_unique_id=p.get("file_unique_id")
-                q.image_mime_type="image/jpeg"
-                test_req.status="done"
-                send_message(tid,"✅ Фото добавлено к вопросу теста. Вернитесь в редактор.")
-                return
-            kb_req=db.scalar(select(KnowledgeMediaUploadRequest).where(KnowledgeMediaUploadRequest.user_id==user.id,KnowledgeMediaUploadRequest.kind=="photo",KnowledgeMediaUploadRequest.status=="waiting",KnowledgeMediaUploadRequest.expires_at>datetime.utcnow()).order_by(KnowledgeMediaUploadRequest.created_at.desc()))
-            if kb_req:
-                p=photos[-1]
-                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
-                db.add(KnowledgeMedia(article_id=kb_req.article_id,uploaded_by=user.id,kind="photo",telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),file_name=None,mime_type="image/jpeg",file_size=p.get("file_size"),caption=msg.get("caption")))
-                kb_req.status="done"
-                send_message(tid,"✅ Фото добавлено в базу знаний. Вернитесь в статью, чтобы вставить его в текст.")
-                return
-            task_req=db.scalar(select(TaskAttachmentRequest).where(TaskAttachmentRequest.user_id==user.id,TaskAttachmentRequest.kind=="photo",TaskAttachmentRequest.status=="waiting",TaskAttachmentRequest.expires_at>datetime.utcnow()).order_by(TaskAttachmentRequest.created_at.desc()))
-            if task_req:
-                p=photos[-1]
-                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
-                db.add(TaskAttachment(task_id=task_req.task_id,assignee_id=task_req.assignee_id,checklist_item_id=task_req.checklist_item_id,uploaded_by=user.id,kind="photo",telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),file_name=None,mime_type="image/jpeg",file_size=p.get("file_size"),label=task_req.label))
-                task_req.status="done"
-                send_message(tid,"✅ Фото прикреплено к задаче.")
-                return
-            req=db.scalar(select(PhotoRequest).where(PhotoRequest.user_id==user.id,PhotoRequest.status=="waiting",PhotoRequest.expires_at>datetime.utcnow()).order_by(PhotoRequest.created_at.desc()))
-            if not req:
-                send_message(tid,"Сейчас Core не ожидает фотографию. Сначала нажмите «Добавить фото» в MiniApp.");return
-            p=photos[-1]
-            mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
-            store_id=None
-            model_map={"shift_report":ShiftReport,"inspection":Inspection,"task":Task,"cash_collection":CashCollection}
-            model=model_map.get(req.entity_type)
-            if model:
-                entity=db.get(model,req.entity_id)
-                store_id=getattr(entity,"store_id",None) if entity else None
-            elif req.entity_type=="shift_report_field":
-                value=db.get(ShiftReportValue,req.entity_id)
-                report=db.get(ShiftReport,value.report_id) if value else None
-                store_id=report.store_id if report else None
-            elif req.entity_type=="inspection_value":
-                value=db.get(InspectionValue,req.entity_id)
-                inspection=db.get(Inspection,value.inspection_id) if value else None
-                store_id=inspection.store_id if inspection else None
-            db.add(Photo(entity_type=req.entity_type,entity_id=req.entity_id,store_id=store_id,uploaded_by=user.id,telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),label=req.label))
-            req.status="done"
-            send_message(tid,"✅ Фото прикреплено.")

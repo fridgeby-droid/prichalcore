@@ -6,6 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import or_, select
+from app.services.batching import preload, grouped
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
@@ -19,7 +20,7 @@ from app.db.models import (
     WorkAbsence, WorkScheduleChange, WorkShiftAssignment,
 )
 from app.services.telegram import file_download_url, get_file_path, send_message
-from app.services.storage import media_download_url
+from app.services.storage import s3_photo_response
 
 router = APIRouter(prefix="/api/profile", tags=["profile"])
 
@@ -106,11 +107,8 @@ def _task_item(db: Session, assignee: TaskAssignee):
 
 
 def _article_visible_for_user(db: Session, user: User, article: KnowledgeArticle) -> bool:
-    try:
-        from app.api.knowledge import _article_visible
-        return _article_visible(db, user, article)
-    except Exception:
-        return article.status == "published"
+    from app.api.knowledge import _article_visible
+    return _article_visible(db, user, article)
 
 
 @router.get("/me")
@@ -165,36 +163,16 @@ def update_profile(payload: ProfilePatch, user=Depends(get_current_user), db: Se
 
 @router.post("/avatar-request")
 def avatar_request(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    employee = _employee_for_user(db, user)
-    for old in db.scalars(select(PhotoRequest).where(PhotoRequest.user_id == user.id, PhotoRequest.status == "waiting")).all():
-        old.status = "cancelled"
-    req = PhotoRequest(user_id=user.id, entity_type="profile_avatar", entity_id=employee.id, label="Фото профиля", status="waiting", expires_at=datetime.utcnow() + timedelta(minutes=PHOTO_REQUEST_TTL_MINUTES))
-    db.add(req); db.commit(); db.refresh(req)
-    send_message(user.telegram_id, "📷 Отправьте фотографию для личной страницы. Core автоматически установит последнее отправленное фото как аватар.")
-    return {"ok": True, "request_id": req.id}
+    raise HTTPException(410,"Фото добавляются прямо в Mini App. Обновите приложение")
 
 
 @router.get("/avatar")
-def avatar(user=Depends(get_current_user), db: Session = Depends(get_db)):
+def avatar(*, thumbnail: bool = False, user=Depends(get_current_user), db: Session = Depends(get_db)):
     employee = _employee_for_user(db, user)
     photo = _avatar_photo(db, employee)
     if not photo:
         raise HTTPException(404, "Фото профиля не загружено")
-    url = media_download_url(db, photo.telegram_file_id)
-    client = httpx.Client(timeout=30)
-    response = client.stream("GET", url)
-    response.__enter__()
-    if response.status_code != 200:
-        response.__exit__(None, None, None); client.close()
-        raise HTTPException(502, "Не удалось получить фото из Telegram")
-    ctype = response.headers.get("content-type", "image/jpeg")
-    def gen():
-        try:
-            for chunk in response.iter_bytes():
-                yield chunk
-        finally:
-            response.__exit__(None, None, None); client.close()
-    return StreamingResponse(gen(), media_type=ctype, headers={"Cache-Control":"private, max-age=60"})
+    return s3_photo_response(db, photo.telegram_file_id,media_id=photo.media_id,thumbnail=thumbnail)
 
 
 @router.get("/work")
@@ -209,6 +187,8 @@ def profile_work(user=Depends(get_current_user), db: Session = Depends(get_db)):
     shift_rows = [{"id": x.id, "work_date": x.work_date, "shift_type": x.shift_type, "store_id": x.store_id, "store_name": stores.get(x.store_id, str(x.store_id))} for x in shifts]
     absences = list(db.scalars(select(WorkAbsence).where(WorkAbsence.employee_id == employee.id, WorkAbsence.date_from <= future_to, WorkAbsence.date_to >= past_from).order_by(WorkAbsence.date_from)).all())
     assignees = list(db.scalars(select(TaskAssignee).where(TaskAssignee.employee_id == employee.id).order_by(TaskAssignee.created_at.desc()).limit(200)).all())
+    preload(db, TaskV2, [a.task_id for a in assignees])
+    preload(db, Store, [a.source_store_id for a in assignees])
     tasks = [x for x in (_task_item(db, a) for a in assignees) if x]
     handovers = list(db.scalars(select(ShiftReport).where(ShiftReport.employee_id == employee.id).order_by(ShiftReport.submitted_at.desc()).limit(30)).all())
     handover_rows = []
@@ -228,17 +208,23 @@ def profile_work(user=Depends(get_current_user), db: Session = Depends(get_db)):
 @router.get("/learning")
 def profile_learning(user=Depends(get_current_user), db: Session = Depends(get_db)):
     employee = _employee_for_user(db, user)
+    from app.db.models import KnowledgeSection
+    sections = list(db.scalars(select(KnowledgeSection)).all())
+    db.info.setdefault("batch_refs", []).extend(sections)
+    acknowledgements = {(a.article_id, a.revision): a for a in db.scalars(select(KnowledgeAcknowledgement).where(KnowledgeAcknowledgement.user_id == user.id)).all()}
     required = []
     for a in db.scalars(select(KnowledgeArticle).where(KnowledgeArticle.status == "published", KnowledgeArticle.required_ack.is_(True)).order_by(KnowledgeArticle.updated_at.desc())).all():
         if not _article_visible_for_user(db, user, a):
             continue
-        ack = db.scalar(select(KnowledgeAcknowledgement).where(KnowledgeAcknowledgement.article_id == a.id, KnowledgeAcknowledgement.user_id == user.id, KnowledgeAcknowledgement.revision == a.revision))
+        ack = acknowledgements.get((a.id, a.revision))
         required.append({"id":a.id,"title":a.title,"acknowledged":bool(ack),"acknowledged_at":ack.acknowledged_at if ack else None})
     assignments = list(db.scalars(select(TrainingAssignment).where(TrainingAssignment.employee_id == employee.id).order_by(TrainingAssignment.created_at.desc())).all())
+    preload(db, TrainingTest, [a.test_id for a in assignments])
+    attempt_map = grouped(db, TrainingAttempt, TrainingAttempt.assignment_id, [a.id for a in assignments], TrainingAttempt.attempt_no.desc())
     test_rows = []
     for a in assignments:
         test = db.get(TrainingTest, a.test_id)
-        attempts = list(db.scalars(select(TrainingAttempt).where(TrainingAttempt.assignment_id == a.id).order_by(TrainingAttempt.attempt_no.desc())).all())
+        attempts = attempt_map[a.id]
         test_rows.append({
             "assignment_id":a.id,"test_id":a.test_id,"title":test.title if test else "Тест",
             "status":a.status,"status_name":TEST_STATUS_NAMES.get(a.status,a.status),"due_at":a.due_at,
@@ -254,18 +240,16 @@ def profile_learning(user=Depends(get_current_user), db: Session = Depends(get_d
 @router.get("/activity")
 def profile_activity(limit: int = 100, user=Depends(get_current_user), db: Session = Depends(get_db)):
     employee = _employee_for_user(db, user)
+    limit = max(1, min(limit, 200))
     events = []
-    for a in db.scalars(select(KnowledgeAcknowledgement).where(KnowledgeAcknowledgement.user_id == user.id).order_by(KnowledgeAcknowledgement.acknowledged_at.desc()).limit(limit)).all():
-        article = db.get(KnowledgeArticle, a.article_id)
+    for a, article in db.execute(select(KnowledgeAcknowledgement, KnowledgeArticle).outerjoin(KnowledgeArticle, KnowledgeArticle.id == KnowledgeAcknowledgement.article_id).where(KnowledgeAcknowledgement.user_id == user.id).order_by(KnowledgeAcknowledgement.acknowledged_at.desc()).limit(limit)).all():
         events.append({"at":a.acknowledged_at,"kind":"knowledge","title":f"Ознакомился(ась) со статьёй «{article.title if article else 'Материал'}»"})
-    for a in db.scalars(select(TrainingAttempt).where(TrainingAttempt.employee_id == employee.id, TrainingAttempt.completed_at.is_not(None)).order_by(TrainingAttempt.completed_at.desc()).limit(limit)).all():
-        test = db.get(TrainingTest, a.test_id)
+    for a, test in db.execute(select(TrainingAttempt, TrainingTest).outerjoin(TrainingTest, TrainingTest.id == TrainingAttempt.test_id).where(TrainingAttempt.employee_id == employee.id, TrainingAttempt.completed_at.is_not(None)).order_by(TrainingAttempt.completed_at.desc()).limit(limit)).all():
         score = f" — {float(a.score_percent):.0f}%" if a.score_percent is not None else ""
         events.append({"at":a.completed_at,"kind":"test","title":f"Прошёл(а) тест «{test.title if test else 'Тест'}»{score}"})
     for r in db.scalars(select(ShiftReport).where(ShiftReport.employee_id == employee.id).order_by(ShiftReport.submitted_at.desc()).limit(limit)).all():
         events.append({"at":r.submitted_at,"kind":"handover","title":f"Отправил(а) пересменку · {r.status}"})
-    for h in db.scalars(select(TaskHistory).where(TaskHistory.user_id == user.id).order_by(TaskHistory.created_at.desc()).limit(limit)).all():
-        task = db.get(TaskV2, h.task_id)
+    for h, task in db.execute(select(TaskHistory, TaskV2).outerjoin(TaskV2, TaskV2.id == TaskHistory.task_id).where(TaskHistory.user_id == user.id).order_by(TaskHistory.created_at.desc()).limit(limit)).all():
         events.append({"at":h.created_at,"kind":"task","title":f"Задача «{task.title if task else 'Задача'}»: {h.action}"})
     for c in db.scalars(select(WorkScheduleChange).where(or_(WorkScheduleChange.employee_id == employee.id, WorkScheduleChange.changed_by == user.id)).order_by(WorkScheduleChange.created_at.desc()).limit(limit)).all():
         events.append({"at":c.created_at,"kind":"schedule","title":f"Изменение графика: {c.action}"})

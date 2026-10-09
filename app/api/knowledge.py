@@ -32,7 +32,7 @@ from app.db.models import (
     User,
 )
 from app.services.telegram import file_download_url, get_file_path
-from app.services.storage import media_download_url
+from app.services.storage import media_download_url, s3_photo_response
 from app.services.notifications import notify_knowledge_published
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
@@ -156,15 +156,17 @@ def _article_dict(db: Session, article: KnowledgeArticle, include_content: bool 
     section = db.get(KnowledgeSection, article.section_id)
     author = db.get(User, article.author_id) if article.author_id else None
     store = db.get(Store, article.store_id) if article.store_id else None
-    media = list(db.scalars(select(KnowledgeMedia).where(KnowledgeMedia.article_id == article.id).order_by(KnowledgeMedia.created_at)).all())
+    media = list(db.scalars(select(KnowledgeMedia).where(KnowledgeMedia.article_id == article.id).order_by(KnowledgeMedia.created_at)).all()) if include_content else []
     acked = False
-    if user:
+    if user and "knowledge_acks" in db.info:
+        acked = (article.id,article.revision) in db.info["knowledge_acks"]
+    elif user:
         acked = db.scalar(select(KnowledgeAcknowledgement).where(
             KnowledgeAcknowledgement.article_id == article.id,
             KnowledgeAcknowledgement.user_id == user.id,
             KnowledgeAcknowledgement.revision == article.revision,
         )) is not None
-    links = list(db.scalars(select(KnowledgeArticleLink).where(KnowledgeArticleLink.article_id == article.id).order_by(KnowledgeArticleLink.id)).all())
+    links = list(db.scalars(select(KnowledgeArticleLink).where(KnowledgeArticleLink.article_id == article.id).order_by(KnowledgeArticleLink.id)).all()) if include_content else []
     payload = {
         "id": article.id,
         "section_id": article.section_id,
@@ -332,8 +334,13 @@ def list_articles(section_id: int | None = None, status: str | None = None, user
         q = q.where(KnowledgeArticle.section_id == section_id)
     if status and _can_manage_articles(db,user): q=q.where(KnowledgeArticle.status==status)
     elif not _can_manage_articles(db,user): q=q.where(KnowledgeArticle.status=="published")
+    from app.services.batching import preload
+    articles=list(db.scalars(q).all())
+    db.info.setdefault("batch_refs",[]).extend(db.scalars(select(KnowledgeSection)).all())
+    preload(db,User,[a.author_id for a in articles]);preload(db,Store,[a.store_id for a in articles])
+    db.info["knowledge_acks"]=set(db.execute(select(KnowledgeAcknowledgement.article_id,KnowledgeAcknowledgement.revision).where(KnowledgeAcknowledgement.user_id==user.id)).all())
     rows = []
-    for a in db.scalars(q).all():
+    for a in articles:
         if _article_visible(db, user, a):
             rows.append(_article_dict(db, a, include_content=False, user=user))
     return rows
@@ -402,7 +409,7 @@ def update_article(article_id: int, payload: dict, user=Depends(get_current_user
     if payload.get("status")=="published": require_access(db,user,"knowledge.publish","edit")
     if payload.get("status")=="archived": require_access(db,user,"knowledge.archive","edit")
     if "required_ack" in payload: require_access(db,user,"knowledge.required","edit")
-    a = db.get(KnowledgeArticle, article_id)
+    a = db.get(KnowledgeArticle,article_id,with_for_update=True,populate_existing=True)
     if not a:
         raise HTTPException(404, "Статья не найдена")
     old_status = a.status
@@ -447,7 +454,7 @@ def update_article(article_id: int, payload: dict, user=Depends(get_current_user
 @router.delete("/articles/{article_id}")
 def archive_article(article_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"knowledge.archive","edit")
-    a = db.get(KnowledgeArticle, article_id)
+    a = db.get(KnowledgeArticle,article_id,with_for_update=True,populate_existing=True)
     if not a:
         raise HTTPException(404, "Статья не найдена")
     a.status = "archived"
@@ -509,7 +516,7 @@ def required_for_me(user=Depends(get_current_user), db: Session = Depends(get_db
 @router.post("/articles/{article_id}/acknowledge")
 def acknowledge(article_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"knowledge.read")
-    a = db.get(KnowledgeArticle, article_id)
+    a = db.get(KnowledgeArticle,article_id,with_for_update=True,populate_existing=True)
     if not a or a.status != "published" or not _article_visible(db, user, a):
         raise HTTPException(404, "Статья недоступна")
     if not a.required_ack:
@@ -577,10 +584,11 @@ def acknowledgement_control(article_id: int, user=Depends(get_current_user), db:
 
 @router.post("/articles/{article_id}/media-request")
 def media_request(article_id: int, payload: MediaRequestIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if payload.kind=="photo":raise HTTPException(410,"Фото добавляются прямо в Mini App")
     require_access(db,user,"knowledge.edit","edit")
     if payload.kind not in MEDIA_KINDS:
         raise HTTPException(400, "Поддерживаются фото и видео")
-    a = db.get(KnowledgeArticle, article_id)
+    a = db.get(KnowledgeArticle,article_id,with_for_update=True,populate_existing=True)
     if not a:
         raise HTTPException(404, "Сначала сохраните статью")
     req = KnowledgeMediaUploadRequest(article_id=a.id, user_id=user.id, kind=payload.kind, expires_at=datetime.utcnow() + timedelta(minutes=30))
@@ -605,12 +613,16 @@ def delete_media(media_id: int, user=Depends(get_current_user), db: Session = De
     m = db.get(KnowledgeMedia, media_id)
     if not m:
         raise HTTPException(404, "Медиа не найдено")
+    from app.services.media import authorize
+    authorize(db,user,"knowledge_media",m.article_id)
+    from app.db.models import MediaAudit
+    db.add(MediaAudit(media_id=m.media_id,user_id=user.id,entity_type="knowledge_media",entity_id=m.article_id,action="detach"))
     db.delete(m); db.commit()
     return {"ok": True}
 
 
 @router.get("/media/{media_id}/content")
-def media_content(media_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def media_content(*, thumbnail: bool = False, media_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"knowledge.read") if not _can_manage_articles(db,user) else None
     m = db.get(KnowledgeMedia, media_id)
     if not m:
@@ -618,6 +630,8 @@ def media_content(media_id: int, user=Depends(get_current_user), db: Session = D
     article = db.get(KnowledgeArticle, m.article_id)
     if not article or not _article_visible(db, user, article):
         raise HTTPException(403, "Нет доступа к медиа")
+    if m.kind == "photo":
+        return s3_photo_response(db,m.telegram_file_id,media_id=m.media_id,thumbnail=thumbnail,media_type=m.mime_type)
     try:
         url = media_download_url(db, m.telegram_file_id)
         with httpx.Client(timeout=60) as client:
