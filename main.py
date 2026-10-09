@@ -38,7 +38,7 @@ async def lifespan(app:FastAPI):
     stop_worker()
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.12",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.13",lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
@@ -55,8 +55,10 @@ async def performance_headers(request: Request, call_next):
     response.headers["X-SQL-Time-ms"]=f'{metrics["sql_ms"]:.1f}'
     elapsed_ms = (time.perf_counter() - started) * 1000
     response.headers["X-Process-Time-ms"] = f"{elapsed_ms:.1f}"
-    if request.url.path.startswith(("/static/app.1.7.12.","/static/media.1.7.12.")):
+    if request.url.path.startswith(("/static/app.1.7.13.","/static/media.1.7.13.","/static/cache.1.7.13.")):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "private, no-store"
     if request.url.path.startswith("/api/") and elapsed_ms >= 150:
         log.info("Slow API %.1f ms %s %s", elapsed_ms, request.method, request.url.path)
     return response
@@ -65,10 +67,10 @@ register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.12","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.13","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.12","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.13","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():
