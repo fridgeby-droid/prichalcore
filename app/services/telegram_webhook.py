@@ -5,6 +5,7 @@ from app.db.database import session_scope
 from app.core.permissions import has_access
 from app.db.models import User,PhotoRequest,Photo,ShiftReport,ShiftReportValue,Inspection,InspectionValue,Task,CashCollection,PriceListUploadRequest,PriceList,TaskAttachmentRequest,TaskAttachment,TaskAssignee,KnowledgeMediaUploadRequest,KnowledgeMedia,TrainingQuestionMediaRequest,TrainingQuestion,TelegramDestination
 from app.services.telegram import send_message,miniapp_keyboard
+from app.services.storage import mirror_telegram_photo_to_s3
 
 
 def handle_update(update:dict):
@@ -86,6 +87,7 @@ def handle_update(update:dict):
             profile_req=db.scalar(select(PhotoRequest).where(PhotoRequest.user_id==user.id,PhotoRequest.entity_type=="profile_avatar",PhotoRequest.status=="waiting",PhotoRequest.expires_at>datetime.utcnow()).order_by(PhotoRequest.created_at.desc()))
             if profile_req:
                 p=photos[-1]
+                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
                 db.add(Photo(entity_type="profile_avatar",entity_id=profile_req.entity_id,store_id=None,uploaded_by=user.id,telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),label="Фото профиля"))
                 profile_req.status="done"
                 send_message(tid,"✅ Фото профиля обновлено. Откройте Причал Core снова.")
@@ -97,6 +99,7 @@ def handle_update(update:dict):
                     test_req.status="expired"
                     send_message(tid,"Вопрос теста не найден.");return
                 p=photos[-1]
+                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
                 q.image_telegram_file_id=p["file_id"]
                 q.image_telegram_file_unique_id=p.get("file_unique_id")
                 q.image_mime_type="image/jpeg"
@@ -106,6 +109,7 @@ def handle_update(update:dict):
             kb_req=db.scalar(select(KnowledgeMediaUploadRequest).where(KnowledgeMediaUploadRequest.user_id==user.id,KnowledgeMediaUploadRequest.kind=="photo",KnowledgeMediaUploadRequest.status=="waiting",KnowledgeMediaUploadRequest.expires_at>datetime.utcnow()).order_by(KnowledgeMediaUploadRequest.created_at.desc()))
             if kb_req:
                 p=photos[-1]
+                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
                 db.add(KnowledgeMedia(article_id=kb_req.article_id,uploaded_by=user.id,kind="photo",telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),file_name=None,mime_type="image/jpeg",file_size=p.get("file_size"),caption=msg.get("caption")))
                 kb_req.status="done"
                 send_message(tid,"✅ Фото добавлено в базу знаний. Вернитесь в статью, чтобы вставить его в текст.")
@@ -113,6 +117,7 @@ def handle_update(update:dict):
             task_req=db.scalar(select(TaskAttachmentRequest).where(TaskAttachmentRequest.user_id==user.id,TaskAttachmentRequest.kind=="photo",TaskAttachmentRequest.status=="waiting",TaskAttachmentRequest.expires_at>datetime.utcnow()).order_by(TaskAttachmentRequest.created_at.desc()))
             if task_req:
                 p=photos[-1]
+                mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
                 db.add(TaskAttachment(task_id=task_req.task_id,assignee_id=task_req.assignee_id,checklist_item_id=task_req.checklist_item_id,uploaded_by=user.id,kind="photo",telegram_file_id=p["file_id"],telegram_file_unique_id=p.get("file_unique_id"),telegram_chat_id=chat.get("id"),telegram_message_id=msg.get("message_id"),file_name=None,mime_type="image/jpeg",file_size=p.get("file_size"),label=task_req.label))
                 task_req.status="done"
                 send_message(tid,"✅ Фото прикреплено к задаче.")
@@ -121,6 +126,7 @@ def handle_update(update:dict):
             if not req:
                 send_message(tid,"Сейчас Core не ожидает фотографию. Сначала нажмите «Добавить фото» в MiniApp.");return
             p=photos[-1]
+            mirror_telegram_photo_to_s3(db,p["file_id"],p.get("file_unique_id"))
             store_id=None
             model_map={"shift_report":ShiftReport,"inspection":Inspection,"task":Task,"cash_collection":CashCollection}
             model=model_map.get(req.entity_type)

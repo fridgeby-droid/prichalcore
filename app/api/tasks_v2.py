@@ -18,6 +18,7 @@ from app.core.permissions import (
 from app.db.database import get_db
 from app.services.notifications import notify_task_assignees
 from app.services.telegram import get_file_path, file_download_url, send_message
+from app.services.storage import media_download_url
 from app.db.models import (
     Employee, EmployeeStore, Store, TaskV2, TaskTarget, TaskAssignee,
     TaskChecklistItem, TaskChecklistProgress, TaskComment, TaskHistory,
@@ -608,7 +609,7 @@ def attachment_request(task_id:int,payload:AttachmentRequestIn,user=Depends(get_
 def attachment_content(task_id:int,attachment_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
     t=db.get(TaskV2,task_id);a=db.get(TaskAttachment,attachment_id)
     if not t or not a or a.task_id!=t.id or not task_accessible(db,t,user): raise HTTPException(404,"Файл не найден")
-    path=get_file_path(a.telegram_file_id); url=file_download_url(path)
+    url=media_download_url(db,a.telegram_file_id)
     client=httpx.Client(timeout=30); response=client.stream("GET",url); response.__enter__()
     if response.status_code!=200:
         response.__exit__(None,None,None);client.close();raise HTTPException(502,"Не удалось получить файл из Telegram")

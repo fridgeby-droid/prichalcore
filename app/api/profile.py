@@ -19,6 +19,7 @@ from app.db.models import (
     WorkAbsence, WorkScheduleChange, WorkShiftAssignment,
 )
 from app.services.telegram import file_download_url, get_file_path, send_message
+from app.services.storage import media_download_url
 
 router = APIRouter(prefix="/api/profile", tags=["profile"])
 
@@ -179,8 +180,7 @@ def avatar(user=Depends(get_current_user), db: Session = Depends(get_db)):
     photo = _avatar_photo(db, employee)
     if not photo:
         raise HTTPException(404, "Фото профиля не загружено")
-    path = get_file_path(photo.telegram_file_id)
-    url = file_download_url(path)
+    url = media_download_url(db, photo.telegram_file_id)
     client = httpx.Client(timeout=30)
     response = client.stream("GET", url)
     response.__enter__()

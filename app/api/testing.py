@@ -30,6 +30,7 @@ from app.db.models import (
     User, RoleDefinition,
 )
 from app.services.telegram import file_download_url, get_file_path
+from app.services.storage import media_download_url
 from app.services.notifications import notify_test_assignment
 
 router = APIRouter(prefix="/api/testing", tags=["testing"])
@@ -510,8 +511,7 @@ def question_image(question_id: int, user=Depends(get_current_user), db: Session
         if not active or question_id not in {int(x) for x in (active.question_order_json or [])}:
             raise HTTPException(403, "Изображение доступно только в активном тесте")
     try:
-        path = get_file_path(q.image_telegram_file_id)
-        url = file_download_url(path)
+        url = media_download_url(db, q.image_telegram_file_id)
         with httpx.Client(timeout=60) as client:
             r = client.get(url); r.raise_for_status()
             return Response(content=r.content, media_type=q.image_mime_type or "image/jpeg", headers={"Cache-Control": "private, max-age=300"})

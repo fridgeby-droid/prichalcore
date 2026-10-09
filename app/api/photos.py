@@ -12,6 +12,7 @@ from app.core.permissions import require_access, assert_store_scope, has_access,
 from app.db.database import get_db
 from app.db.models import PhotoRequest,Photo,ShiftReportValue,ShiftReport,InspectionValue,Inspection
 from app.services.telegram import send_message,get_file_path,file_download_url
+from app.services.storage import media_download_url
 
 router=APIRouter(prefix="/api/photos",tags=["photos"])
 
@@ -64,8 +65,7 @@ def photo_content(photo_id:int,user=Depends(get_current_user),db:Session=Depends
     p=db.get(Photo,photo_id)
     if not p:raise HTTPException(404,"Фото не найдено")
     _authorize_entity(db,user,p.entity_type,p.entity_id,write=False)
-    path=get_file_path(p.telegram_file_id)
-    url=file_download_url(path)
+    url=media_download_url(db,p.telegram_file_id)
     client=httpx.Client(timeout=30)
     response=client.stream("GET",url)
     response.__enter__()

@@ -411,6 +411,17 @@ class Photo(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
 
 
+class StoredObject(Base):
+    __tablename__ = "stored_objects"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_file_id: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    telegram_file_unique_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    s3_key: Mapped[str] = mapped_column(Text, unique=True)
+    mime_type: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+
+
 class UnitOfMeasure(Base):
     __tablename__ = "units_of_measure"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

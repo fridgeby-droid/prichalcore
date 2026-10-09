@@ -32,6 +32,7 @@ from app.db.models import (
     User,
 )
 from app.services.telegram import file_download_url, get_file_path
+from app.services.storage import media_download_url
 from app.services.notifications import notify_knowledge_published
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
@@ -618,8 +619,7 @@ def media_content(media_id: int, user=Depends(get_current_user), db: Session = D
     if not article or not _article_visible(db, user, article):
         raise HTTPException(403, "Нет доступа к медиа")
     try:
-        path = get_file_path(m.telegram_file_id)
-        url = file_download_url(path)
+        url = media_download_url(db, m.telegram_file_id)
         with httpx.Client(timeout=60) as client:
             r = client.get(url)
             r.raise_for_status()
