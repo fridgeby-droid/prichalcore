@@ -130,8 +130,8 @@ def profile_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
         "email": employee.email, "telegram_id": employee.telegram_id, "stores": stores,
         "primary_store_id": employee.primary_store_id, "app_theme": employee.app_theme or "light",
         "avatar_photo_id": avatar.id if avatar else None, "mentorship": mentorship,
-        "statistics": {"available": False, "source": "saby", "message": "Личная статистика появится после подключения Saby"},
-        "achievements": {"available": False, "message": "Достижения добавим в следующем этапе"},
+        "statistics": {"available": False, "source": "saby", "message": "Позже"},
+        "achievements": {"available": False, "message": "Позже"},
     }
 
 
