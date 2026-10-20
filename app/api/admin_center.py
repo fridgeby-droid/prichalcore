@@ -131,3 +131,13 @@ def effective(role_key:str,user=Depends(admin_only),db:Session=Depends(get_db)):
     perms={x.permission_key:{"access_level":x.access_level,"data_scope":x.data_scope} for x in db.scalars(select(RolePermission).where(RolePermission.role_key==role_key)).all()}
     if role_key=='admin': perms={k:{"access_level":"edit","data_scope":"network"} for k in all_keys()}
     return {"role":role_row(r),"permissions":perms}
+
+class UserApproval(BaseModel):
+    role_key:str
+
+@router.post('/users/{user_id}/approve')
+def approve_access(user_id:int,payload:UserApproval,user=Depends(admin_only),db:Session=Depends(get_db)):
+    from app.services.user_approval import approve_user
+    obj=approve_user(db,user,user_id,payload.role_key)
+    db.commit()
+    return {'ok':True,'status':obj.status,'role_key':obj.role_key}

@@ -21,6 +21,7 @@ EMPLOYMENT_STATUSES = {"working", "trainee", "vacation", "fired"}
 
 
 class EmployeeIn(BaseModel):
+    approve_role_key: str | None = None
     full_name: str
     position: str = "seller"
     employment_status: str = "working"
@@ -37,6 +38,7 @@ class EmployeeIn(BaseModel):
 
 
 class EmployeePatch(BaseModel):
+    approve_role_key: str | None = None
     full_name: str | None = None
     position: str | None = None
     employment_status: str | None = None
@@ -211,6 +213,10 @@ def create_employee(payload: EmployeeIn, user=Depends(get_current_user), db: Ses
     try:
         db.flush()
         replace_stores(db, e.id, payload.store_ids)
+        if payload.approve_role_key is not None:
+            from app.services.user_approval import approve_user
+            if not e.user_id:raise HTTPException(400,'Выберите связанный Telegram-аккаунт')
+            approve_user(db,user,e.user_id,payload.approve_role_key,employee=e)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -243,6 +249,7 @@ def update_employee(employee_id: int, payload: EmployeePatch, user=Depends(get_c
         validate_position(data["position"])
     if "employment_status" in data:
         validate_status(data["employment_status"])
+    data.pop("approve_role_key",None)
     store_ids = data.pop("store_ids", None)
     for key, value in data.items():
         setattr(e, key, value)
@@ -251,6 +258,10 @@ def update_employee(employee_id: int, payload: EmployeePatch, user=Depends(get_c
         db.flush()
         if store_ids is not None:
             replace_stores(db, e.id, store_ids)
+        if payload.approve_role_key is not None:
+            from app.services.user_approval import approve_user
+            if not e.user_id:raise HTTPException(400,'Выберите связанный Telegram-аккаунт')
+            approve_user(db,user,e.user_id,payload.approve_role_key,employee=e)
         db.commit()
     except IntegrityError:
         db.rollback()
