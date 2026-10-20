@@ -29,6 +29,7 @@ def env(tmp_path,monkeypatch):
     if database._engine:database._engine.dispose()
     database._engine=None;database.SessionLocal=None;database.DATABASE_URL='sqlite:///'+str(tmp_path/'db.sqlite')
     monkeypatch.setattr(main,'start_worker',lambda:None);monkeypatch.setattr(main,'stop_worker',lambda:None)
+    monkeypatch.setattr(main,"start_price_worker",lambda:None);monkeypatch.setattr(main,"stop_price_worker",lambda:None)
     fake=FakeS3()
     for module in [media,storage,api_media]:monkeypatch.setattr(module,'_s3_client',lambda:fake)
     with TestClient(main.app) as client:

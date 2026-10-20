@@ -482,6 +482,10 @@ def init_db():
                 models.CoreDirectoryLink.__table__.create(engine,checkfirst=True)
                 lock.execute(text("INSERT INTO core_directory_state(id,status) VALUES (1,'never') ON CONFLICT (id) DO NOTHING"))
                 lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('directories-1.7.15')"));lock.commit()
+            if 'price-lists-1.7.16' not in done:
+                from app.db.price_migration import upgrade as upgrade_prices
+                upgrade_prices(engine)
+                lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('price-lists-1.7.16')"));lock.commit()
         finally:
             if engine.dialect.name=='postgresql':
                 lock.execute(text("SELECT pg_advisory_unlock(714118)"));lock.commit()

@@ -197,8 +197,8 @@ def order_template_values(db: Session, order: Order) -> dict[str, str]:
     rows = db.execute(select(OrderItem, Product).join(Product, Product.id == OrderItem.product_id).where(OrderItem.order_id == order.id)).all()
     item_lines: list[str] = []
     for item, product in rows:
-        qty = f"{float(item.quantity):g}"
-        item_lines.append(f"• {escape(product.name)} — <b>{escape(qty)} {escape(product.unit)}</b>")
+        qty = format(item.quantity,"f").rstrip("0").rstrip(".") if "." in format(item.quantity,"f") else str(item.quantity)
+        item_lines.append(f"• {escape(item.snapshot_name or product.name)} — <b>{escape(qty)} {escape(item.snapshot_unit or product.unit)}</b>")
     if not item_lines:
         item_lines.append("• Пропуск — товары не требуются")
     return {

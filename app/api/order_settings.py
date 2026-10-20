@@ -233,6 +233,8 @@ def create_product(payload: ProductIn, user=Depends(get_current_user), db: Sessi
 def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
     if "active" in payload:require_access(db,user,"orders.products_disable","edit")
     if any(k in payload for k in ("name","supplier_id","category_id","unit")):require_access(db,user,"orders.products_edit","edit")
+    from app.db.models import ImportedPriceItem
+    if db.scalar(select(ImportedPriceItem.id).where(ImportedPriceItem.product_id==product_id)):raise HTTPException(409,"Импортированный товар настраивается в разделе Прайсы Saby")
     obj = db.get(Product, product_id)
     if not obj: raise HTTPException(404, "Товар не найден")
     for k in ("name", "supplier_id", "category_id", "unit", "active"):
@@ -244,6 +246,8 @@ def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_cu
 @router.delete("/products/{product_id}")
 def delete_product(product_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"orders.products_delete","edit")
+    from app.db.models import ImportedPriceItem
+    if db.scalar(select(ImportedPriceItem.id).where(ImportedPriceItem.product_id==product_id)):raise HTTPException(409,"Импортированный товар настраивается в разделе Прайсы Saby")
     obj = db.get(Product, product_id)
     if not obj: raise HTTPException(404, "Товар не найден")
     db.delete(obj); _commit_or_conflict(db, "Товар уже используется в заявках. Отключите его вместо удаления.")

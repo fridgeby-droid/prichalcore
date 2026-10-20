@@ -18,6 +18,7 @@ from app.services.telegram_inbox import accept_update
 from starlette.concurrency import run_in_threadpool
 from app.services.metrics import request_metrics
 from app.services.media import start_worker, stop_worker
+from app.services.price_import import start_worker as start_price_worker, stop_worker as stop_price_worker
 from app.services.scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -34,11 +35,13 @@ async def lifespan(app:FastAPI):
         try:start_scheduler();log.info("Scheduler started")
         except Exception as e:log.exception("Scheduler start failed: %s",e)
     start_worker()
+    start_price_worker()
     yield
+    stop_price_worker()
     stop_worker()
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.15",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.16",lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
@@ -55,7 +58,7 @@ async def performance_headers(request: Request, call_next):
     response.headers["X-SQL-Time-ms"]=f'{metrics["sql_ms"]:.1f}'
     elapsed_ms = (time.perf_counter() - started) * 1000
     response.headers["X-Process-Time-ms"] = f"{elapsed_ms:.1f}"
-    if request.url.path.startswith(("/static/app.1.7.15.","/static/media.1.7.15.","/static/cache.1.7.15.","/static/directories.1.7.15.")):
+    if request.url.path.startswith(("/static/app.1.7.16.","/static/media.1.7.16.","/static/cache.1.7.16.","/static/directories.1.7.16.","/static/prices.1.7.16.")):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "private, no-store"
@@ -67,10 +70,10 @@ register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.15","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.16","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.15","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.16","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():

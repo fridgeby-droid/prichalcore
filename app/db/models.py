@@ -112,7 +112,7 @@ class Product(Base):
     unit: Mapped[str] = mapped_column(String(64), default="шт")
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
-    __table_args__ = (UniqueConstraint("supplier_id", "name", name="uq_product_supplier_name"),)
+
 
 
 class StoreProduct(Base):
@@ -151,7 +151,9 @@ class OrderItem(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), index=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"), index=True)
-    quantity: Mapped[float] = mapped_column(Numeric(12, 3))
+    quantity: Mapped[float] = mapped_column(Numeric(18, 6))
+    snapshot_name: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    snapshot_unit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     note: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
@@ -1076,3 +1078,50 @@ class CoreDirectoryLink(Base):
     updated_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
     __table_args__ = (UniqueConstraint('kind', 'saby_id', name='uq_core_directory_identity'),)
+
+
+class ImportedPriceList(Base):
+    __tablename__='imported_price_lists'
+    id: Mapped[int]=mapped_column(Integer,primary_key=True)
+    connection: Mapped[str]=mapped_column(String(128))
+    base_url: Mapped[str]=mapped_column(String(500))
+    point_id: Mapped[str]=mapped_column(String(128))
+    external_id: Mapped[str]=mapped_column(String(128))
+    name: Mapped[str]=mapped_column(String(240))
+    supplier_id: Mapped[int]=mapped_column(ForeignKey('suppliers.id'))
+    revision: Mapped[str|None]=mapped_column(String(128),nullable=True)
+    fetched_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
+    synced_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
+    status: Mapped[str]=mapped_column(String(24),default='idle',index=True)
+    error: Mapped[str|None]=mapped_column(String(240),nullable=True)
+    job_token: Mapped[str|None]=mapped_column(String(36),nullable=True)
+    lease_until: Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
+    next_sync_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
+    failures: Mapped[int]=mapped_column(Integer,default=0)
+    auto_sync: Mapped[bool]=mapped_column(Boolean,default=False)
+    __table_args__=(UniqueConstraint('connection','base_url','point_id','external_id',name='uq_imported_price_source'),)
+
+
+class ImportedPriceItem(Base):
+    __tablename__='imported_price_items'
+    id: Mapped[int]=mapped_column(Integer,primary_key=True)
+    price_list_id: Mapped[int]=mapped_column(ForeignKey('imported_price_lists.id'),index=True)
+    external_id: Mapped[str]=mapped_column(String(128))
+    product_id: Mapped[int]=mapped_column(ForeignKey('products.id',ondelete='RESTRICT'),unique=True)
+    present: Mapped[bool]=mapped_column(Boolean,default=True)
+    step: Mapped[object|None]=mapped_column(Numeric(18,6),nullable=True)
+    confirmed_unit: Mapped[str|None]=mapped_column(String(64),nullable=True)
+    images: Mapped[list]=mapped_column(JSON,default=list)
+    __table_args__=(UniqueConstraint('price_list_id','external_id',name='uq_imported_price_item'),)
+
+
+class ImportedPriceImage(Base):
+    __tablename__='imported_price_images'
+    id: Mapped[int]=mapped_column(Integer,primary_key=True)
+    item_id: Mapped[int]=mapped_column(ForeignKey('imported_price_items.id'),index=True)
+    external_id: Mapped[str]=mapped_column(String(128))
+    etag: Mapped[str|None]=mapped_column(String(160),nullable=True)
+    sha256: Mapped[str|None]=mapped_column(String(64),nullable=True)
+    media_id: Mapped[str|None]=mapped_column(ForeignKey('media_assets.id'),nullable=True)
+    error: Mapped[str|None]=mapped_column(String(240),nullable=True)
+    __table_args__=(UniqueConstraint('item_id','external_id',name='uq_imported_price_image'),)

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,7 @@ from app.core.permissions import require_access, assigned_store_ids, assert_stor
 from app.db.database import get_db
 from app.services.notifications import send_order_accepted
 from app.db.models import (
+    ImportedPriceItem, ImportedPriceList,
     Category,
     Order,
     OrderItem,
@@ -33,7 +35,7 @@ DONE_FOR_PROGRESS = {"new", "accepted", "skipped"}
 
 class OrderItemIn(BaseModel):
     product_id: int
-    quantity: float = Field(gt=0)
+    quantity: Decimal = Field(gt=0,max_digits=18,decimal_places=6)
 
 
 class OrderIn(BaseModel):
@@ -77,7 +79,7 @@ def _limit_for(db: Session, product_id: int, store_id: int):
             select(ProductOrderLimit).where(
                 ProductOrderLimit.product_id == product_id,
                 ProductOrderLimit.active.is_(True),
-                ProductOrderLimit.store_id.in_([store_id, None]),
+                ((ProductOrderLimit.store_id==store_id) | ProductOrderLimit.store_id.is_(None)),
             )
         ).all()
     )
@@ -86,27 +88,29 @@ def _limit_for(db: Session, product_id: int, store_id: int):
 
 
 def _validate_items(db: Session, store_id: int, supplier_id: int, items: list[OrderItemIn]):
-    seen = set()
+    ids=[i.product_id for i in items]
+    imported=list(db.scalars(select(ImportedPriceItem).where(ImportedPriceItem.product_id.in_(ids))))
+    list(db.scalars(select(ImportedPriceList).where(ImportedPriceList.id.in_({i.price_list_id for i in imported})).order_by(ImportedPriceList.id).with_for_update()))
+    imported={i.product_id:i for i in db.scalars(select(ImportedPriceItem).where(ImportedPriceItem.product_id.in_(ids)).execution_options(populate_existing=True))}
+    products={p.id:p for p in db.scalars(select(Product).where(Product.id.in_(ids)).order_by(Product.id).with_for_update().execution_options(populate_existing=True))}
+    mappings=list(db.scalars(select(StoreProduct).where(StoreProduct.store_id==store_id)))
+    allowed={m.product_id for m in mappings if m.enabled}
+    seen=set()
     for item in items:
-        if item.product_id in seen:
-            raise HTTPException(400, "Один товар нельзя добавлять в заявку дважды")
+        if item.product_id in seen:raise HTTPException(400,'Один товар нельзя добавлять дважды')
         seen.add(item.product_id)
-        p = db.get(Product, item.product_id)
-        if not p or not p.active or p.supplier_id != supplier_id:
-            raise HTTPException(400, "Товар не относится к выбранному поставщику")
-        lim = _limit_for(db, p.id, store_id)
-        qty = float(item.quantity)
+        p=products.get(item.product_id)
+        if not p or not p.active or p.supplier_id!=supplier_id or (mappings and p.id not in allowed):raise HTTPException(400,'Товар недоступен для заявки')
+        qty=item.quantity
+        imp=imported.get(p.id)
+        if imp:
+            if not imp.present or not imp.step or imp.confirmed_unit!=p.unit:raise HTTPException(400,'Шаг товара требует настройки')
+            if qty % imp.step != 0:raise HTTPException(400,f'{p.name}: количество должно быть кратно {imp.step} {p.unit}')
+        lim=_limit_for(db,p.id,store_id)
         if lim:
-            if lim.min_qty is not None and qty < float(lim.min_qty):
-                raise HTTPException(400, f"{p.name}: минимум {float(lim.min_qty):g} {p.unit}")
-            if lim.max_qty is not None and qty > float(lim.max_qty):
-                raise HTTPException(400, f"{p.name}: максимум {float(lim.max_qty):g} {p.unit}")
-            if lim.step_qty is not None and float(lim.step_qty) > 0:
-                step = float(lim.step_qty)
-                base = float(lim.min_qty or 0)
-                ratio = (qty - base) / step
-                if abs(ratio - round(ratio)) > 1e-6:
-                    raise HTTPException(400, f"{p.name}: количество должно изменяться с шагом {step:g} {p.unit}")
+            if lim.min_qty is not None and qty<lim.min_qty:raise HTTPException(400,'Количество меньше минимума')
+            if lim.max_qty is not None and qty>lim.max_qty:raise HTTPException(400,'Количество больше максимума')
+            if not imp and lim.step_qty and (qty-Decimal(str(lim.min_qty or 0))) % lim.step_qty != 0:raise HTTPException(400,'Количество не кратно шагу')
 
 
 def _order_dict(db: Session, o: Order, include_items: bool = True):
@@ -141,9 +145,10 @@ def _order_dict(db: Session, o: Order, include_items: bool = True):
             {
                 "id": oi.id,
                 "product_id": p.id,
-                "name": p.name,
-                "unit": p.unit,
+                "name": oi.snapshot_name or p.name,
+                "unit": oi.snapshot_unit or p.unit,
                 "quantity": float(oi.quantity),
+                "quantity_text": str(oi.quantity),
             }
             for oi, p in rows
         ]
@@ -273,10 +278,20 @@ def available_products(store_id: int, supplier_id: int, user=Depends(get_current
     q = select(Product).where(Product.supplier_id == supplier_id, Product.active.is_(True))
     if mappings:
         q = q.where(Product.id.in_(mapped or [-1]))
+    from app.services.price_import import selected_photos
+    products=list(db.scalars(q.order_by(Product.name)))
+    imported={i.product_id:i for i in db.scalars(select(ImportedPriceItem).where(ImportedPriceItem.product_id.in_([p.id for p in products])))}
+    photos=selected_photos(db,list(imported.values()))
+    limits=list(db.scalars(select(ProductOrderLimit).where(ProductOrderLimit.product_id.in_([p.id for p in products]),ProductOrderLimit.active.is_(True),((ProductOrderLimit.store_id==store_id)|ProductOrderLimit.store_id.is_(None)))))
+    limit_by={l.product_id:l for l in limits if l.store_id is None}
+    limit_by.update({l.product_id:l for l in limits if l.store_id==store_id})
+    categories={c.id:c for c in db.scalars(select(Category).where(Category.id.in_([p.category_id for p in products if p.category_id])))}
     result = []
-    for p in db.scalars(q.order_by(Product.name)).all():
-        lim = _limit_for(db, p.id, store_id)
-        cat = db.get(Category, p.category_id) if p.category_id else None
+    for p in products:
+        imp=imported.get(p.id)
+        if imp and (not imp.present or not imp.step or imp.confirmed_unit!=p.unit):continue
+        lim = limit_by.get(p.id)
+        cat = categories.get(p.category_id)
         result.append(
             {
                 "id": p.id,
@@ -286,10 +301,24 @@ def available_products(store_id: int, supplier_id: int, user=Depends(get_current
                 "category_name": cat.name if cat else None,
                 "min_qty": float(lim.min_qty) if lim and lim.min_qty is not None else None,
                 "max_qty": float(lim.max_qty) if lim and lim.max_qty is not None else None,
-                "step_qty": float(lim.step_qty) if lim and lim.step_qty is not None else None,
+                "step_qty": str(imp.step) if imp else (str(lim.step_qty) if lim and lim.step_qty is not None else None),
+                "image_url": f"/api/orders/products/{p.id}/photo?store_id={store_id}" if photos.get(p.id) else None,
             }
         )
     return result
+
+
+@router.get('/products/{product_id}/photo')
+def product_photo(product_id:int,store_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,'orders.create','edit');assert_store_scope(db,user,'orders.create',store_id,minimum='edit',own_as_assigned=True)
+    mappings=list(db.scalars(select(StoreProduct).where(StoreProduct.store_id==store_id)))
+    if mappings and product_id not in {m.product_id for m in mappings if m.enabled}:raise HTTPException(404,'Фото отсутствует')
+    from app.services.price_import import selected_photos
+    from app.services.storage import s3_photo_response
+    item=db.scalar(select(ImportedPriceItem).where(ImportedPriceItem.product_id==product_id))
+    photos=selected_photos(db,[item]).get(product_id,[]) if item else []
+    if not photos:raise HTTPException(404,'Фото отсутствует')
+    return s3_photo_response(db,media_id=photos[0].media_id,thumbnail=True)
 
 
 @router.post("")
@@ -326,7 +355,7 @@ def create_order(payload: OrderIn, user=Depends(get_current_user), db: Session =
     db.add(order)
     db.flush()
     for item in payload.items:
-        db.add(OrderItem(order_id=order.id, product_id=item.product_id, quantity=item.quantity, note=None))
+        db.add(OrderItem(order_id=order.id, product_id=item.product_id, quantity=item.quantity, snapshot_name=db.get(Product,item.product_id).name, snapshot_unit=db.get(Product,item.product_id).unit, note=None))
     db.commit()
     db.refresh(order)
     return _order_dict(db, order)
@@ -380,7 +409,7 @@ def share_order_text(order_id: int, user=Depends(get_current_user), db: Session 
     lines = [f"🏪 {data['store_name']}", f"🚚 {data['supplier_name']}", "", "📦 Заявка:"]
     if data["items"]:
         for item in data["items"]:
-            qty = f"{item['quantity']:g}"
+            qty = item['quantity_text'].rstrip('0').rstrip('.')
             lines.append(f"• {item['name']} — {qty} {item['unit']}")
     else:
         lines.append("• Пропуск — товары не требуются")
@@ -415,13 +444,14 @@ def update_order(order_id: int, payload: dict, user=Depends(get_current_user), d
     if "items" in payload:
         if o.status != "new":
             raise HTTPException(409, "Состав заявки можно менять только пока статус «Новая»")
-        parsed = [OrderItemIn(**x) for x in payload["items"]]
+        try:parsed = [OrderItemIn(**x) for x in payload["items"]]
+        except (ValidationError,TypeError):raise HTTPException(422,"Некорректный состав или количество")
         if not parsed:
             raise HTTPException(400, "В заявке должен быть хотя бы один товар")
         _validate_items(db, o.store_id, o.supplier_id, parsed)
         db.execute(delete(OrderItem).where(OrderItem.order_id == o.id))
         for item in parsed:
-            db.add(OrderItem(order_id=o.id, product_id=item.product_id, quantity=item.quantity, note=None))
+            db.add(OrderItem(order_id=o.id, product_id=item.product_id, quantity=item.quantity, snapshot_name=db.get(Product,item.product_id).name, snapshot_unit=db.get(Product,item.product_id).unit, note=None))
     db.commit()
     db.refresh(o)
     delivery = None
