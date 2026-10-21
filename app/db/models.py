@@ -1111,6 +1111,9 @@ class ImportedPriceItem(Base):
     present: Mapped[bool]=mapped_column(Boolean,default=True)
     step: Mapped[object|None]=mapped_column(Numeric(18,6),nullable=True)
     confirmed_unit: Mapped[str|None]=mapped_column(String(64),nullable=True)
+    source_name: Mapped[str|None]=mapped_column(String(255),nullable=True)
+    source_unit: Mapped[str|None]=mapped_column(String(64),nullable=True)
+    overrides: Mapped[dict]=mapped_column(JSON,default=dict)
     images: Mapped[list]=mapped_column(JSON,default=list)
     __table_args__=(UniqueConstraint('price_list_id','external_id',name='uq_imported_price_item'),)
 

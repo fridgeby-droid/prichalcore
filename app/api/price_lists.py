@@ -89,7 +89,7 @@ def step(iid:int,payload:Step,user=Depends(admin_only),db:Session=Depends(get_db
     db.refresh(item)
     product=db.get(Product,item.product_id,with_for_update=True)
     if product.unit!=payload.unit:raise HTTPException(409,'Единица изменилась. Обновите список и подтвердите шаг')
-    item.step=payload.step;item.confirmed_unit=product.unit;product.active=item.present
+    item.step=payload.step;item.confirmed_unit=product.unit;product.active=item.present and not (item.overrides or {}).get('disabled')
     audit(db,user,'step','price_item',iid,{'step':str(payload.step),'unit':payload.unit});db.commit();return {'ok':True}
 
 @router.get('/items/{iid}/photo')

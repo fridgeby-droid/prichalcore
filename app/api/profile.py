@@ -64,6 +64,15 @@ def _employee_for_user(db: Session, user: User) -> Employee:
     return employee
 
 
+def _read_employee(db,user,employee_id):
+    if employee_id is None:return _employee_for_user(db,user)
+    from app.api.employees import _assert_employee_scope
+    employee=db.get(Employee,employee_id)
+    if not employee:raise HTTPException(404,"Сотрудник не найден")
+    _assert_employee_scope(db,user,employee,"employees.other_profiles")
+    return employee
+
+
 def _stores(db: Session, employee_id: int, primary_store_id: int | None):
     rows = list(db.execute(
         select(Store.id, Store.name)
@@ -112,8 +121,17 @@ def _article_visible_for_user(db: Session, user: User, article: KnowledgeArticle
 
 
 @router.get("/me")
-def profile_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    employee = _employee_for_user(db, user)
+def profile_me(employee_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    employee = _read_employee(db, user, employee_id)
+    from app.core.permissions import has_access
+    contacts=employee_id is None
+    if employee_id is not None:
+        from app.api.employees import _assert_employee_scope
+        try:
+            _assert_employee_scope(db,user,employee,"employees.contacts")
+            contacts=True
+        except HTTPException:
+            contacts=False
     stores = _stores(db, employee.id, employee.primary_store_id)
     avatar = _avatar_photo(db, employee)
     mentorship = None
@@ -126,8 +144,8 @@ def profile_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
         "id": employee.id, "full_name": employee.full_name, "position": employee.position,
         "position_name": POSITION_NAMES.get(employee.position, employee.position),
         "employment_status": employee.employment_status, "status_name": STATUS_NAMES.get(employee.employment_status, employee.employment_status),
-        "hire_date": employee.hire_date, "tenure": _tenure(employee.hire_date), "phone": employee.phone,
-        "email": employee.email, "telegram_id": employee.telegram_id, "stores": stores,
+        "hire_date": employee.hire_date, "tenure": _tenure(employee.hire_date), "phone": employee.phone if contacts else None,
+        "email": employee.email if contacts else None, "telegram_id": employee.telegram_id, "stores": stores,
         "primary_store_id": employee.primary_store_id, "app_theme": employee.app_theme or "light",
         "avatar_photo_id": avatar.id if avatar else None, "mentorship": mentorship,
         "statistics": {"available": False, "source": "saby", "message": "Личная статистика появится после подключения Saby"},
@@ -147,7 +165,7 @@ def update_profile(payload: ProfilePatch, user=Depends(get_current_user), db: Se
             raise HTTPException(400, "Проверьте адрес электронной почты")
         employee.email = email or None
     if "app_theme" in data:
-        if data["app_theme"] not in {"system", "mint", "ocean", "sand", "lavender", "graphite", "light", "dark"}:
+        if data["app_theme"] not in {"system", "mint", "ocean", "sand", "lavender", "graphite", "forest", "rose", "midnight", "light", "dark"}:
             raise HTTPException(400, "Неизвестная тема оформления")
         employee.app_theme = data["app_theme"]
     if "primary_store_id" in data:
@@ -176,8 +194,8 @@ def avatar(*, thumbnail: bool = False, user=Depends(get_current_user), db: Sessi
 
 
 @router.get("/work")
-def profile_work(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    employee = _employee_for_user(db, user)
+def profile_work(employee_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    employee = _read_employee(db, user, employee_id)
     today = date.today(); past_from = today - timedelta(days=90); future_to = today + timedelta(days=90)
     stores = {s.id: s.name for s in db.scalars(select(Store)).all()}
     shifts = list(db.scalars(select(WorkShiftAssignment).where(
@@ -206,15 +224,16 @@ def profile_work(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 
 @router.get("/learning")
-def profile_learning(user=Depends(get_current_user), db: Session = Depends(get_db)):
-    employee = _employee_for_user(db, user)
+def profile_learning(employee_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    employee = _read_employee(db, user, employee_id)
+    subject=db.get(User,employee.user_id) if employee.user_id else None
     from app.db.models import KnowledgeSection
     sections = list(db.scalars(select(KnowledgeSection)).all())
     db.info.setdefault("batch_refs", []).extend(sections)
-    acknowledgements = {(a.article_id, a.revision): a for a in db.scalars(select(KnowledgeAcknowledgement).where(KnowledgeAcknowledgement.user_id == user.id)).all()}
+    acknowledgements = {(a.article_id, a.revision): a for a in db.scalars(select(KnowledgeAcknowledgement).where(KnowledgeAcknowledgement.user_id == (employee.user_id or -1))).all()}
     required = []
     for a in db.scalars(select(KnowledgeArticle).where(KnowledgeArticle.status == "published", KnowledgeArticle.required_ack.is_(True)).order_by(KnowledgeArticle.updated_at.desc())).all():
-        if not _article_visible_for_user(db, user, a):
+        if subject is None or not _article_visible_for_user(db, subject, a):
             continue
         ack = acknowledgements.get((a.id, a.revision))
         required.append({"id":a.id,"title":a.title,"acknowledged":bool(ack),"acknowledged_at":ack.acknowledged_at if ack else None})
@@ -238,20 +257,20 @@ def profile_learning(user=Depends(get_current_user), db: Session = Depends(get_d
 
 
 @router.get("/activity")
-def profile_activity(limit: int = 100, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    employee = _employee_for_user(db, user)
+def profile_activity(limit: int = 100, employee_id: int | None = None, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    employee = _read_employee(db, user, employee_id)
     limit = max(1, min(limit, 200))
     events = []
-    for a, article in db.execute(select(KnowledgeAcknowledgement, KnowledgeArticle).outerjoin(KnowledgeArticle, KnowledgeArticle.id == KnowledgeAcknowledgement.article_id).where(KnowledgeAcknowledgement.user_id == user.id).order_by(KnowledgeAcknowledgement.acknowledged_at.desc()).limit(limit)).all():
+    for a, article in db.execute(select(KnowledgeAcknowledgement, KnowledgeArticle).outerjoin(KnowledgeArticle, KnowledgeArticle.id == KnowledgeAcknowledgement.article_id).where(KnowledgeAcknowledgement.user_id == (employee.user_id or -1)).order_by(KnowledgeAcknowledgement.acknowledged_at.desc()).limit(limit)).all():
         events.append({"at":a.acknowledged_at,"kind":"knowledge","title":f"Ознакомился(ась) со статьёй «{article.title if article else 'Материал'}»"})
     for a, test in db.execute(select(TrainingAttempt, TrainingTest).outerjoin(TrainingTest, TrainingTest.id == TrainingAttempt.test_id).where(TrainingAttempt.employee_id == employee.id, TrainingAttempt.completed_at.is_not(None)).order_by(TrainingAttempt.completed_at.desc()).limit(limit)).all():
         score = f" — {float(a.score_percent):.0f}%" if a.score_percent is not None else ""
         events.append({"at":a.completed_at,"kind":"test","title":f"Прошёл(а) тест «{test.title if test else 'Тест'}»{score}"})
     for r in db.scalars(select(ShiftReport).where(ShiftReport.employee_id == employee.id).order_by(ShiftReport.submitted_at.desc()).limit(limit)).all():
         events.append({"at":r.submitted_at,"kind":"handover","title":f"Отправил(а) пересменку · {r.status}"})
-    for h, task in db.execute(select(TaskHistory, TaskV2).outerjoin(TaskV2, TaskV2.id == TaskHistory.task_id).where(TaskHistory.user_id == user.id).order_by(TaskHistory.created_at.desc()).limit(limit)).all():
+    for h, task in db.execute(select(TaskHistory, TaskV2).outerjoin(TaskV2, TaskV2.id == TaskHistory.task_id).where(TaskHistory.user_id == (employee.user_id or -1)).order_by(TaskHistory.created_at.desc()).limit(limit)).all():
         events.append({"at":h.created_at,"kind":"task","title":f"Задача «{task.title if task else 'Задача'}»: {h.action}"})
-    for c in db.scalars(select(WorkScheduleChange).where(or_(WorkScheduleChange.employee_id == employee.id, WorkScheduleChange.changed_by == user.id)).order_by(WorkScheduleChange.created_at.desc()).limit(limit)).all():
+    for c in db.scalars(select(WorkScheduleChange).where(or_(WorkScheduleChange.employee_id == employee.id, WorkScheduleChange.changed_by == (employee.user_id or -1))).order_by(WorkScheduleChange.created_at.desc()).limit(limit)).all():
         events.append({"at":c.created_at,"kind":"schedule","title":f"Изменение графика: {c.action}"})
     events = [x for x in events if x["at"]]
     events.sort(key=lambda x: x["at"], reverse=True)

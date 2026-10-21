@@ -486,6 +486,10 @@ def init_db():
                 from app.db.price_migration import upgrade as upgrade_prices
                 upgrade_prices(engine)
                 lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('price-lists-1.7.16')"));lock.commit()
+            if 'usability-1.7.19' not in done:
+                from app.db.usability_migration import upgrade as upgrade_usability
+                upgrade_usability(engine)
+                lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('usability-1.7.19')"));lock.commit()
         finally:
             if engine.dialect.name=='postgresql':
                 lock.execute(text("SELECT pg_advisory_unlock(714118)"));lock.commit()

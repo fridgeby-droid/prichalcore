@@ -5,14 +5,14 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
 from app.core.permissions import require_access, require_any_access, assigned_store_ids, current_employee, effective_permission, assert_store_scope, has_access
 from app.db.database import get_db
-from app.db.models import Employee, EmployeeStore, Store, User, WorkAbsence, WorkShiftAssignment, WorkSubstitution
+from app.db.models import Photo, Employee, EmployeeStore, Store, User, WorkAbsence, WorkShiftAssignment, WorkSubstitution
 
 router = APIRouter(prefix="/api/employees", tags=["employees"])
 
@@ -92,6 +92,7 @@ def employee_dict(db: Session, e: Employee) -> dict[str, Any]:
     ).all())
     user = db.get(User, e.user_id) if e.user_id else None
     return {
+        "avatar_photo_id": db.info.get("employee_avatar_ids",{}).get(e.id),
         "id": e.id,
         "full_name": e.full_name,
         "position": e.position,
@@ -157,7 +158,9 @@ def list_employees(
         stmt = stmt.join(EmployeeStore, EmployeeStore.employee_id == Employee.id).where(EmployeeStore.store_id == store_id)
     if q:
         stmt = stmt.where(Employee.full_name.ilike(f"%{q.strip()}%"))
-    return [_strip_contacts(db,user,employee_dict(db,e)) for e in db.scalars(stmt).unique().all()]
+    employees=list(db.scalars(stmt).unique().all())
+    db.info["employee_avatar_ids"]=dict(db.execute(select(Photo.entity_id,func.max(Photo.id)).where(Photo.entity_type=="profile_avatar",Photo.entity_id.in_([e.id for e in employees])).group_by(Photo.entity_id)).all())
+    return [_strip_contacts(db,user,employee_dict(db,e)) for e in employees]
 
 
 @router.get("/meta")
@@ -291,3 +294,15 @@ def delete_employee(employee_id: int, user=Depends(get_current_user), db: Sessio
     db.delete(e)
     db.commit()
     return {"ok": True, "soft_deleted": False}
+
+
+@router.get("/{employee_id}/avatar")
+def employee_avatar(employee_id:int,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    employee=db.get(Employee,employee_id)
+    if not employee:raise HTTPException(404,"Сотрудник не найден")
+    _assert_employee_scope(db,user,employee,"employees.view")
+    from app.api.profile import _avatar_photo
+    from app.services.storage import s3_photo_response
+    photo=_avatar_photo(db,employee)
+    if not photo:raise HTTPException(404,"Фото отсутствует")
+    return s3_photo_response(db,photo.telegram_file_id,media_id=photo.media_id,thumbnail=True)

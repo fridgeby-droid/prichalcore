@@ -218,7 +218,15 @@ class ProductIn(BaseModel):
 @router.get("/products")
 def products(user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_any_access(db,user,("orders.products_create","orders.products_edit","orders.products_disable","orders.products_delete","orders.import","orders.create","orders.list"),"view")
-    return [row(x, "id", "name", "supplier_id", "category_id", "unit", "active") for x in db.scalars(select(Product).order_by(Product.name)).all()]
+    from app.db.models import ImportedPriceItem
+    imported={i.product_id:i for i in db.scalars(select(ImportedPriceItem))}
+    limits={l.product_id:l for l in db.scalars(select(ProductOrderLimit).where(ProductOrderLimit.store_id.is_(None),ProductOrderLimit.active.is_(True)))}
+    result=[]
+    for p in db.scalars(select(Product).order_by(Product.name)):
+        item=imported.get(p.id);lim=limits.get(p.id)
+        step=item.step if item else lim.step_qty if lim else None
+        result.append({**row(p,"id","name","supplier_id","category_id","unit","active"),"imported":bool(item),"step_qty":str(step) if step else None,"step_confirmed":bool(item and item.confirmed_unit==p.unit),"source_name":item.source_name if item else None,"source_unit":item.source_unit if item else None,"overrides":item.overrides or {} if item else {}})
+    return result
 
 
 @router.post("/products")
@@ -231,16 +239,62 @@ def create_product(payload: ProductIn, user=Depends(get_current_user), db: Sessi
 
 @router.patch("/products/{product_id}")
 def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    from decimal import Decimal, InvalidOperation
+    from app.db.models import ImportedPriceItem, ImportedPriceList
+    if set(payload)!={"active"}:require_access(db,user,"orders.products_edit","edit")
     if "active" in payload:require_access(db,user,"orders.products_disable","edit")
-    if any(k in payload for k in ("name","supplier_id","category_id","unit")):require_access(db,user,"orders.products_edit","edit")
-    from app.db.models import ImportedPriceItem
-    if db.scalar(select(ImportedPriceItem.id).where(ImportedPriceItem.product_id==product_id)):raise HTTPException(409,"Импортированный товар настраивается в разделе Прайсы Saby")
-    obj = db.get(Product, product_id)
-    if not obj: raise HTTPException(404, "Товар не найден")
-    for k in ("name", "supplier_id", "category_id", "unit", "active"):
-        if k in payload: setattr(obj, k, payload[k])
-    _commit_or_conflict(db, "Не удалось изменить товар")
-    return row(obj, "id", "name", "supplier_id", "category_id", "unit", "active")
+    item=db.scalar(select(ImportedPriceItem).where(ImportedPriceItem.product_id==product_id))
+    if item:
+        db.scalar(select(ImportedPriceList).where(ImportedPriceList.id==item.price_list_id).with_for_update())
+        db.refresh(item)
+    obj=db.scalar(select(Product).where(Product.id==product_id).with_for_update().execution_options(populate_existing=True))
+    if not obj:raise HTTPException(404,"Товар не найден")
+    overrides=dict(item.overrides or {}) if item else {}
+    if item and "supplier_id" in payload and payload['supplier_id']!=obj.supplier_id:
+        raise HTTPException(400,"Поставщик импортированных товаров назначается всему прайсу")
+    reset=payload.get('reset_source',[])
+    if not isinstance(reset,list) or any(k not in {'name','unit'} for k in reset):raise HTTPException(422,"Неверные поля Saby")
+    old_unit=obj.unit
+    for key in ('name','unit'):
+        if key in reset:
+            value=getattr(item,'source_'+key,None) if item else None
+            if not value:raise HTTPException(409,"Значение источника ещё не загружено")
+            setattr(obj,key,value);overrides.pop(key,None)
+        elif key in payload:
+            value=payload[key]
+            if not isinstance(value,str) or not value.strip() or len(value.strip())>(64 if key=='unit' else 240):raise HTTPException(422,"Проверьте название и единицу измерения")
+            if value.strip()!=getattr(obj,key) and item:overrides[key]=True
+            setattr(obj,key,value.strip())
+    for key,model in [('supplier_id',Supplier),('category_id',Category)]:
+        if key in payload:
+            value=payload[key]
+            if (value is None and key=='supplier_id') or (value is not None and not db.get(model,value)):raise HTTPException(400,"Не найден поставщик или категория")
+            setattr(obj,key,value)
+    if obj.category_id:
+        cat=db.get(Category,obj.category_id)
+        if cat.supplier_id and cat.supplier_id!=obj.supplier_id:raise HTTPException(400,"Категория другого поставщика")
+    if item and old_unit!=obj.unit:item.confirmed_unit=None
+    if 'step_qty' in payload:
+        try:
+            step=Decimal(str(payload['step_qty']))
+            if not step.is_finite() or step<=0 or step>=Decimal('1000000000000') or step.as_tuple().exponent < -6:raise ValueError()
+        except (InvalidOperation,ValueError):raise HTTPException(422,"Шаг должен быть положительным, до 6 знаков после запятой")
+        if item:
+            if payload.get('expected_unit')!=obj.unit:raise HTTPException(409,"Единица изменилась. Проверьте и подтвердите шаг")
+            item.step=step;item.confirmed_unit=obj.unit
+        else:
+            lim=db.scalar(select(ProductOrderLimit).where(ProductOrderLimit.product_id==product_id,ProductOrderLimit.store_id.is_(None)))
+            if not lim:lim=ProductOrderLimit(product_id=product_id);db.add(lim)
+            lim.step_qty=step;lim.active=True
+    if 'active' in payload:
+        if not isinstance(payload['active'],bool):raise HTTPException(422,"Некорректная активность")
+        obj.active=payload['active']
+        if item:overrides['disabled']=not payload['active']
+    if item:
+        item.overrides=overrides
+        obj.active=bool(item.present and item.step and item.confirmed_unit==obj.unit and not overrides.get('disabled'))
+    _commit_or_conflict(db,"Не удалось изменить товар")
+    return row(obj,"id","name","supplier_id","category_id","unit","active")
 
 
 @router.delete("/products/{product_id}")
@@ -496,6 +550,9 @@ async def import_products(file: UploadFile = File(...), user=Depends(get_current
         pkey = (supplier.id, name.lower())
         product = product_map.get(pkey)
         if product:
+            from app.db.models import ImportedPriceItem
+            if db.scalar(select(ImportedPriceItem.id).where(ImportedPriceItem.product_id==product.id)):
+                errors.append({"row":idx,"error":"Товар Saby: используйте редактор товара"});continue
             product.category_id = category_id
             product.unit = unit.short_name
             product.active = True

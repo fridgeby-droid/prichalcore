@@ -16,6 +16,7 @@ from app.db.database import get_db
 from app.services.notifications import send_order_accepted
 from app.db.models import (
     ImportedPriceItem, ImportedPriceList,
+    Employee,
     Category,
     Order,
     OrderItem,
@@ -29,8 +30,8 @@ from app.db.models import (
 )
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
-ORDER_STATUSES = {"new", "accepted", "cancelled", "skipped"}
-DONE_FOR_PROGRESS = {"new", "accepted", "skipped"}
+ORDER_STATUSES = {"new", "accepted", "cancelled", "skipped", "comment_only"}
+DONE_FOR_PROGRESS = {"new", "accepted", "skipped", "comment_only"}
 
 
 class OrderItemIn(BaseModel):
@@ -116,7 +117,7 @@ def _validate_items(db: Session, store_id: int, supplier_id: int, items: list[Or
 def _order_dict(db: Session, o: Order, include_items: bool = True):
     store = db.get(Store, o.store_id)
     supplier = db.get(Supplier, o.supplier_id)
-    creator = db.get(User, o.created_by)
+    creator = db.scalar(select(Employee).where(Employee.user_id == o.created_by))
     accepted_by = db.get(User, o.accepted_by) if getattr(o, "accepted_by", None) else None
     data = {
         "id": o.id,
@@ -125,14 +126,14 @@ def _order_dict(db: Session, o: Order, include_items: bool = True):
         "supplier_id": o.supplier_id,
         "supplier_name": supplier.name if supplier else f"Поставщик #{o.supplier_id}",
         "created_by": o.created_by,
-        "creator_name": (creator.full_name or creator.username or str(creator.telegram_id)) if creator else "—",
+        "creator_name": creator.full_name if creator else "Сотрудник не привязан",
         "status": o.status,
         "comment": o.comment,
         "accepted_by": getattr(o, "accepted_by", None),
         "accepted_by_name": (accepted_by.full_name or accepted_by.username or str(accepted_by.telegram_id)) if accepted_by else None,
-        "accepted_at": o.accepted_at.isoformat() if getattr(o, "accepted_at", None) else None,
-        "created_at": o.created_at.isoformat(),
-        "updated_at": o.updated_at.isoformat(),
+        "accepted_at": o.accepted_at.replace(tzinfo=ZoneInfo("UTC")).isoformat() if getattr(o, "accepted_at", None) else None,
+        "created_at": o.created_at.replace(tzinfo=ZoneInfo("UTC")).isoformat(),
+        "updated_at": o.updated_at.replace(tzinfo=ZoneInfo("UTC")).isoformat(),
     }
     if include_items:
         rows = db.execute(
@@ -220,6 +221,7 @@ def today_availability(user=Depends(get_current_user), db: Session = Depends(get
                 "deadline_time": s.deadline_time,
                 "done": s.id in status_by_supplier,
                 "status": status_by_supplier.get(s.id),
+                "overdue": s.id not in status_by_supplier and bool(s.deadline_time and now.strftime("%H:%M") >= s.deadline_time),
             }
             for s in suppliers
         ]
@@ -231,6 +233,7 @@ def today_availability(user=Depends(get_current_user), db: Session = Depends(get
                 "total": len(supplier_data),
                 "done": done_count,
                 "complete": done_count == len(supplier_data),
+                "overdue": any(x["overdue"] for x in supplier_data),
                 "suppliers": supplier_data,
             }
         )
@@ -264,6 +267,7 @@ def available_suppliers(store_id: int, user=Depends(get_current_user), db: Sessi
             "name": s.name,
             "deadline_time": s.deadline_time,
             "done_today": s.id in done,
+            "exists_today": s.id in {sid for sid, _ in existing},
             "status": done.get(s.id),
         }
         for s in suppliers
@@ -324,31 +328,38 @@ def product_photo(product_id:int,store_id:int,user=Depends(get_current_user),db:
 @router.post("")
 def create_order(payload: OrderIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     require_access(db,user,"orders.create","edit"); assert_store_scope(db,user,"orders.create",payload.store_id,minimum="edit",own_as_assigned=True)
-    store = db.get(Store, payload.store_id)
+    # Lock the store before checking the daily limit; concurrent creates serialize.
+    store = db.scalar(select(Store).where(Store.id == payload.store_id).with_for_update())
     supplier = db.get(Supplier, payload.supplier_id)
     if not store or not store.active:
         raise HTTPException(404, "Магазин не найден")
     if not supplier or not supplier.active:
         raise HTTPException(404, "Поставщик не найден")
 
-    today_suppliers = _scheduled_supplier_ids(db, payload.store_id, _local_now().weekday())
+    now=_local_now()
+    today_suppliers = _scheduled_supplier_ids(db, payload.store_id, now.weekday())
     if payload.supplier_id not in today_suppliers:
         raise HTTPException(409, "Сегодня по графику заявок этот поставщик недоступен для выбранного магазина")
+
+    start, end = _local_day_bounds(now.date())
+    if db.scalar(select(Order.id).where(Order.store_id == payload.store_id, Order.supplier_id == payload.supplier_id, Order.created_at >= start, Order.created_at < end).limit(1)):
+        raise HTTPException(409, "Заявка этому поставщику от магазина сегодня уже создана. Измените её или удалите перед созданием новой.")
 
     if payload.skip:
         if payload.items:
             raise HTTPException(400, "Для пропуска список товаров должен быть пустым")
         status = "skipped"
     else:
-        if not payload.items:
-            raise HTTPException(400, "Добавьте хотя бы один товар или отметьте «Пропуск»")
+        if not payload.items and not (payload.comment or "").strip():
+            raise HTTPException(400, "Добавьте товар, напишите комментарий или отметьте «Пропуск»")
         _validate_items(db, payload.store_id, payload.supplier_id, payload.items)
-        status = "new"
+        status = "new" if payload.items else "comment_only"
 
     order = Order(
         store_id=payload.store_id,
         supplier_id=payload.supplier_id,
         created_by=user.id,
+        created_at=now.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
         status=status,
         comment=payload.comment,
     )
@@ -412,59 +423,97 @@ def share_order_text(order_id: int, user=Depends(get_current_user), db: Session 
             qty = item['quantity_text'].rstrip('0').rstrip('.')
             lines.append(f"• {item['name']} — {qty} {item['unit']}")
     else:
-        lines.append("• Пропуск — товары не требуются")
+        lines.append("• Пропуск — товары не требуются" if o.status == "skipped" else "• Только комментарий")
     if data.get("comment"):
         lines.extend(["", f"💬 {data['comment']}"])
     return {"text": "\n".join(lines)}
 
 
+def _apply_order_update(db, o, payload, user):
+    if not payload or set(payload)-{"status","items","comment"}:
+        raise HTTPException(422,"Укажите статус, состав или комментарий")
+    previously_accepted=o.accepted_at is not None
+    old_status = o.status
+    requested = payload.get("status", old_status)
+    if requested not in ORDER_STATUSES:
+        raise HTTPException(400, "Неизвестный статус")
+    if "status" in payload:
+        key = "orders.accept" if requested == "accepted" else "orders.cancel" if requested == "cancelled" else "orders.edit_new"
+        assert_own_or_scope(db,user,key,owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
+    if "items" in payload or "comment" in payload:
+        assert_own_or_scope(db,user,"orders.edit_new",owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
+        if old_status not in {"new", "comment_only"}:
+            raise HTTPException(409,"Редактирование доступно для новой заявки и заявки только с комментарием")
+    comment = payload.get("comment", o.comment)
+    if comment is not None and not isinstance(comment, str):
+        raise HTTPException(422,"Комментарий должен быть текстом")
+    parsed = None
+    if "items" in payload:
+        try:
+            parsed = [OrderItemIn(**x) for x in payload["items"]]
+        except (ValidationError, TypeError, ValueError):
+            raise HTTPException(422,"Некорректный состав или количество")
+        _validate_items(db,o.store_id,o.supplier_id,parsed)
+    has_items = bool(parsed) if parsed is not None else bool(db.scalar(select(OrderItem.id).where(OrderItem.order_id==o.id).limit(1)))
+    if requested == "skipped":
+        has_items = False
+        parsed = []
+    if requested in {"new", "comment_only"}:
+        if not has_items and not (comment or "").strip():
+            raise HTTPException(400,"Укажите товары или комментарий")
+        if requested == "comment_only" and has_items and "status" in payload:
+            raise HTTPException(400,"Для статуса «Только комментарий» уберите товары")
+        requested = "new" if has_items else "comment_only"
+    if parsed is not None:
+        db.execute(delete(OrderItem).where(OrderItem.order_id==o.id))
+        for item in parsed:
+            product=db.get(Product,item.product_id)
+            db.add(OrderItem(order_id=o.id,product_id=item.product_id,quantity=item.quantity,snapshot_name=product.name,snapshot_unit=product.unit))
+    o.comment=comment
+    o.status=requested
+    if requested == "accepted" and old_status != "accepted":
+        o.accepted_by=user.id
+        o.accepted_at=datetime.utcnow()
+        db.flush()
+        # Queue in the same transaction as acceptance. Delivery runs separately.
+        return send_order_accepted(db,o.id,force=previously_accepted)
+    return None
+
+
 @router.patch("/{order_id}")
 def update_order(order_id: int, payload: dict, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    o = db.get(Order, order_id)
-    if not o:
-        raise HTTPException(404, "Заявка не найдена")
-    old_status=o.status
-    if "status" in payload:
-        rs=str(payload["status"]); pk="orders.accept" if rs=="accepted" else ("orders.cancel" if rs=="cancelled" else "orders.edit_new")
-        require_access(db,user,pk,"edit"); assert_own_or_scope(db,user,pk,owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
-    if "items" in payload or "comment" in payload:
-        require_access(db,user,"orders.edit_new","edit"); assert_own_or_scope(db,user,"orders.edit_new",owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
-    if "status" in payload:
-        status = str(payload["status"])
-        if status not in ORDER_STATUSES:
-            raise HTTPException(400, "Неизвестный статус")
-        o.status = status
-        if status == "accepted" and old_status != "accepted":
-            o.accepted_by = user.id
-            o.accepted_at = datetime.utcnow()
-        if status == "skipped":
-            db.execute(delete(OrderItem).where(OrderItem.order_id == o.id))
-    if "comment" in payload:
-        o.comment = payload["comment"]
-    if "items" in payload:
-        if o.status != "new":
-            raise HTTPException(409, "Состав заявки можно менять только пока статус «Новая»")
-        try:parsed = [OrderItemIn(**x) for x in payload["items"]]
-        except (ValidationError,TypeError):raise HTTPException(422,"Некорректный состав или количество")
-        if not parsed:
-            raise HTTPException(400, "В заявке должен быть хотя бы один товар")
-        _validate_items(db, o.store_id, o.supplier_id, parsed)
-        db.execute(delete(OrderItem).where(OrderItem.order_id == o.id))
-        for item in parsed:
-            db.add(OrderItem(order_id=o.id, product_id=item.product_id, quantity=item.quantity, snapshot_name=db.get(Product,item.product_id).name, snapshot_unit=db.get(Product,item.product_id).unit, note=None))
+    o=db.scalar(select(Order).where(Order.id==order_id).with_for_update())
+    if not o:raise HTTPException(404,"Заявка не найдена")
+    delivery=_apply_order_update(db,o,payload,user)
     db.commit()
-    db.refresh(o)
-    delivery = None
-    if old_status != "accepted" and o.status == "accepted":
-        try:
-            delivery = send_order_accepted(db, o.id)
-            db.commit()
-        except Exception as exc:
-            db.rollback()
-            delivery = {"status": "error", "error": str(exc)}
-    result = _order_dict(db, o)
-    result["telegram_delivery"] = delivery
+    result=_order_dict(db,o)
+    result["telegram_delivery"]=delivery
     return result
+
+
+class BulkOrderIn(BaseModel):
+    ids: list[int] = Field(min_length=1,max_length=100)
+    action: str
+
+
+@router.post("/bulk")
+def bulk_orders(payload: BulkOrderIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    require_access(db,user,"orders.bulk","edit")
+    if payload.action not in {"delete", "accepted", "cancelled", "new"}:
+        raise HTTPException(400,"Неизвестное массовое действие")
+    ids=sorted(set(payload.ids))
+    rows=list(db.scalars(select(Order).where(Order.id.in_(ids)).order_by(Order.id).with_for_update()))
+    if len(rows)!=len(ids):raise HTTPException(409,"Список заявок изменился. Обновите его")
+    deliveries=[]
+    for o in rows:
+        assert_own_or_scope(db,user,"orders.bulk",owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
+        if payload.action=="delete":
+            assert_own_or_scope(db,user,"orders.delete",owner_user_id=o.created_by,store_id=o.store_id,minimum="edit")
+            db.delete(o)
+        else:
+            deliveries.append({"order_id":o.id,"delivery":_apply_order_update(db,o,{"status":payload.action},user)})
+    db.commit()
+    return {"ok":True,"count":len(rows),"deliveries":deliveries}
 
 
 @router.delete("/{order_id}")

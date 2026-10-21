@@ -39,6 +39,11 @@ class EventTemplateSpec:
 
 
 EVENT_TEMPLATE_SPECS: dict[str, EventTemplateSpec] = {
+    "order_missing": EventTemplateSpec(
+        event_type="order_missing",name="Не подана заявка",category="Заявки",audience="personal",
+        body="⚠️ <b>Не подана заявка</b>\nМагазин: {store_name}\nПоставщик: {supplier_name}\nСрок подачи: {deadline}\nДата: {date}",
+        variables={"store_name":VariableSpec("Магазин","Батумская, 5"),"supplier_name":VariableSpec("Поставщик","Доставка"),"deadline":VariableSpec("Срок подачи","08:00"),"date":VariableSpec("Дата","21.10.2026")},
+    ),
     "order_accepted": EventTemplateSpec(
         event_type="order_accepted", name="Принятая заявка поставщику", category="Заявки", audience="group",
         body=(

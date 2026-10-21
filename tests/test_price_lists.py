@@ -77,7 +77,7 @@ def test_order_decimal_and_history(prices):
         db.add(OrderScheduleRule(store_id=ids['sid'],supplier_id=sid,weekday=_local_now().weekday(),schedule_type='order',active=True))
     payload={'store_id':ids['sid'],'supplier_id':sid,'items':[{'product_id':i.product_id,'quantity':'0.3'}]}
     r=client.post('/api/orders',json=payload,headers=auth);assert r.status_code==200,r.text;o=r.json();assert o['items'][0]['quantity_text']=='0.300000'
-    payload['items'][0]['quantity']='0.300001';assert client.post('/api/orders',json=payload,headers=auth).status_code==400
+    payload['items'][0]['quantity']='0.300001';assert client.patch('/api/orders/'+str(o['id']),json={'items':payload['items']},headers=auth).status_code==400
     d=snapshot();d['products'][0].update(name='New',unit='шт');svc.apply_snapshot(cid,'one',d)
     saved=client.get('/api/orders/'+str(o['id']),headers=auth).json();assert saved['items'][0]['name']=='Хлеб';assert saved['items'][0]['unit']=='кг'
     assert client.patch('/api/orders/'+str(o['id']),headers=auth,json={'items':[{'product_id':i.product_id,'quantity':'NaN'}]}).status_code==422

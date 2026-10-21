@@ -192,7 +192,10 @@ def _employee_name(employee: Employee | None) -> str:
 def order_template_values(db: Session, order: Order) -> dict[str, str]:
     store = db.get(Store, order.store_id)
     supplier = db.get(Supplier, order.supplier_id)
-    creator = db.get(User, order.created_by)
+    creator = db.scalar(select(Employee).where(Employee.user_id==order.created_by))
+    from zoneinfo import ZoneInfo
+    from app.core.config import APP_TIMEZONE
+    local_created=order.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(APP_TIMEZONE))
     accepted_by = db.get(User, order.accepted_by) if getattr(order, "accepted_by", None) else None
     rows = db.execute(select(OrderItem, Product).join(Product, Product.id == OrderItem.product_id).where(OrderItem.order_id == order.id)).all()
     item_lines: list[str] = []
@@ -200,16 +203,16 @@ def order_template_values(db: Session, order: Order) -> dict[str, str]:
         qty = format(item.quantity,"f").rstrip("0").rstrip(".") if "." in format(item.quantity,"f") else str(item.quantity)
         item_lines.append(f"• {escape(item.snapshot_name or product.name)} — <b>{escape(qty)} {escape(item.snapshot_unit or product.unit)}</b>")
     if not item_lines:
-        item_lines.append("• Пропуск — товары не требуются")
+        item_lines.append("• Только комментарий" if order.comment else "• Пропуск — товары не требуются")
     return {
         "store_name": store.name if store else f"Магазин #{order.store_id}",
         "supplier_name": supplier.name if supplier else f"#{order.supplier_id}",
-        "date": order.created_at.strftime("%d.%m.%Y") if order.created_at else "",
-        "time": order.created_at.strftime("%H:%M") if order.created_at else "",
+        "date": local_created.strftime("%d.%m.%Y") if order.created_at else "",
+        "time": local_created.strftime("%H:%M") if order.created_at else "",
         "order_id": str(order.id),
         "order_items": "\n".join(item_lines),
         "comment": order.comment or "Без комментария",
-        "created_by": _user_name(creator),
+        "created_by": creator.full_name if creator else "Сотрудник не привязан",
         "accepted_by": _user_name(accepted_by),
         "total_items": str(len(rows)),
     }

@@ -176,7 +176,7 @@ def _badge_data(db: Session, user) -> dict[str,int]:
 
     if _allowed(db,user,"orders.list"):
         p=_perm(db,user,"orders.list")
-        q=select(func.count(Order.id)).where(Order.status.in_(["new","skipped"]))
+        q=select(func.count(Order.id)).where(Order.status.in_(["new","comment_only"]))
         if p["data_scope"]=="own":
             q=q.where(Order.created_by==user.id)
         else:
@@ -386,7 +386,7 @@ def _widget_values(db: Session, user, requested_keys: set[str] | None = None) ->
             "count":int(
                 db.scalar(
                     select(func.count(Order.id)).where(
-                        Order.status=="new",
+                        Order.status.in_(["new","comment_only"]),
                         Order.store_id.in_(ids or [-1]),
                     )
                 ) or 0

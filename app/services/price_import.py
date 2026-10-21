@@ -119,9 +119,13 @@ def apply_snapshot(cid,token,data):
                 item=Item(price_list_id=cid,external_id=entry['id'],product_id=p.id,present=True,images=[]);db.add(item)
             else:
                 p=products[item.product_id]
-                if p.unit!=entry['unit']:item.confirmed_unit=None
-            p.name=entry['name'];p.unit=entry['unit'];p.supplier_id=row.supplier_id;item.present=True
-            item.images=entry['images'];p.active=bool(item.step and item.step>0 and item.confirmed_unit==p.unit)
+                if (item.source_unit or p.unit)!=entry['unit']:item.confirmed_unit=None
+            overrides=item.overrides or {}
+            item.source_name=entry['name'];item.source_unit=entry['unit']
+            if not overrides.get('name'):p.name=entry['name']
+            if not overrides.get('unit'):p.unit=entry['unit']
+            p.supplier_id=row.supplier_id;item.present=True
+            item.images=entry['images'];p.active=bool(item.step and item.step>0 and item.confirmed_unit==p.unit and not (item.overrides or {}).get('disabled'))
         for sid,item in known.items():
             if sid not in live:item.present=False;products[item.product_id].active=False
         row.name=data['price_list']['name'];row.revision=data['revision'];row.fetched_at=fetched;row.synced_at=datetime.utcnow();row.lease_until=datetime.utcnow()+timedelta(minutes=10)

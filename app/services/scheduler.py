@@ -26,7 +26,7 @@ def _local_now():
 
 def _sent(db: Session, key: str) -> bool:
     if "scheduler_sent" not in db.info:
-        db.info["scheduler_sent"]=set(db.scalars(select(NotificationLog.dedupe_key).where(NotificationLog.created_at>=datetime.utcnow()-timedelta(days=8))).all())
+        db.info["scheduler_sent"]=set(db.scalars(select(NotificationLog.dedupe_key).where(NotificationLog.sent_at>=datetime.utcnow()-timedelta(days=8))).all())
     return key in db.info["scheduler_sent"]
 
 
@@ -85,22 +85,24 @@ def process_task_alerts():
 
 
 def process_order_deadlines():
-    now=_local_now(); wd=now.weekday(); hhmm=now.strftime("%H:%M"); day=now.date()
+    from app.api.orders import _local_day_bounds, DONE_FOR_PROGRESS
+    from app.db.models import OrderScheduleRule, Employee, EmployeeStore
+    from app.services.message_templates import render_event
+    now=_local_now(); day=now.date(); start,end=_local_day_bounds(day)
     with session_scope() as db:
-        schedules=db.execute(select(StoreSupplierSchedule,Supplier,Store).join(Supplier,Supplier.id==StoreSupplierSchedule.supplier_id).join(Store,Store.id==StoreSupplierSchedule.store_id).where(StoreSupplierSchedule.active.is_(True),StoreSupplierSchedule.weekday==wd,Supplier.active.is_(True),Store.active.is_(True))).all()
+        schedules=db.execute(select(OrderScheduleRule,Supplier,Store).join(Supplier,Supplier.id==OrderScheduleRule.supplier_id).join(Store,Store.id==OrderScheduleRule.store_id).where(OrderScheduleRule.active.is_(True),OrderScheduleRule.schedule_type=='order',OrderScheduleRule.weekday==now.weekday(),Supplier.active.is_(True),Store.active.is_(True))).all()
         for sch,sup,store in schedules:
-            if sup.deadline_time!=hhmm:continue
-            start=datetime.combine(day,datetime.min.time());end=start+timedelta(days=1)
-            exists=db.scalar(select(Order.id).where(Order.store_id==store.id,Order.supplier_id==sup.id,Order.created_at>=start,Order.created_at<end))
+            if not sup.deadline_time or now.strftime('%H:%M') < sup.deadline_time:continue
+            exists=db.scalar(select(Order.id).where(Order.store_id==store.id,Order.supplier_id==sup.id,Order.created_at>=start,Order.created_at<end,Order.status.in_(DONE_FOR_PROGRESS)).limit(1))
             if exists:continue
-            users=_users_for(db,["seller","mentor","manager","operations_director"],[store.id])
-            for u in users:
+            managers=db.scalars(select(User).join(Employee,Employee.user_id==User.id).join(EmployeeStore,EmployeeStore.employee_id==Employee.id).where(EmployeeStore.store_id==store.id,Employee.position=='manager',Employee.active.is_(True),Employee.employment_status!='fired',User.active.is_(True),User.status=='active')).unique().all()
+            rendered=render_event(db,'order_missing',{'store_name':store.name,'supplier_name':sup.name,'deadline':sup.deadline_time,'date':day.strftime('%d.%m.%Y')})
+            if not rendered.get('active',True):continue
+            for u in managers:
                 key=f"order-missing:{store.id}:{sup.id}:{day}:{u.id}"
                 if _sent(db,key):continue
-                try:
-                    _queue_alert(db,key,u.telegram_id,f"⚠️ <b>Нет заявки поставщику</b>\n{store.name} — {sup.name}\nСрок: {sup.deadline_time}")
-                    _mark(db,key,u.id,"order_missing")
-                except Exception:pass
+                _queue_alert(db,key,u.telegram_id,rendered['text'],rendered.get('reply_markup'))
+                _mark(db,key,u.id,'order_missing')
 
 
 def process_shift_deadlines():
