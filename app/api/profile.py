@@ -148,8 +148,8 @@ def profile_me(employee_id: int | None = None, user=Depends(get_current_user), d
         "email": employee.email if contacts else None, "telegram_id": employee.telegram_id, "stores": stores,
         "primary_store_id": employee.primary_store_id, "app_theme": employee.app_theme or "light",
         "avatar_photo_id": avatar.id if avatar else None, "mentorship": mentorship,
-        "statistics": {"available": False, "source": "saby", "message": "Личная статистика появится после подключения Saby"},
-        "achievements": {"available": False, "message": "Достижения добавим в следующем этапе"},
+        "statistics": {"available": False, "source": "saby", "message": "Позже"},
+        "achievements": {"available": False, "message": "Позже"},
     }
 
 
