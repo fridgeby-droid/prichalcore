@@ -1,0 +1,4 @@
+const {test}=require('node:test');const assert=require('node:assert/strict');
+const {CoreScreenCache}=require('../miniapp/screens.1.7.22.js');
+test('screen cache bounds nodes, expires entries and separates owners',()=>{let owner='a',now=0;const c=new CoreScreenCache({owner:()=>owner,now:()=>now,maxEntries:2,maxNodes:3,maxAge:100});const e=()=>({nodes:[{}],dirty:false});c.put('a',e());c.put('b',e());c.put('c',e());assert.equal(c.take('a'),null);assert.ok(c.take('b'));now=101;assert.equal(c.take('c'),null);c.put('d',e());owner='b';assert.equal(c.take('d'),null);c.put('large',{nodes:[{querySelectorAll:()=>[1,2,3]}]});assert.equal(c.entries.size,0);});
+test('mutation preserves only dirty snapshots marked for validation',()=>{const c=new CoreScreenCache({owner:()=>1});c.put('draft',{nodes:[{}],dirty:true});c.put('list',{nodes:[{}],dirty:false});c.invalidate();assert.equal(c.take('list'),null);assert.equal(c.take('draft').stale,true);});
