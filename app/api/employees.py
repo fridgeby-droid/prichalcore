@@ -83,14 +83,14 @@ def replace_stores(db: Session, employee_id: int, store_ids: list[int]):
         db.add(EmployeeStore(employee_id=employee_id, store_id=sid))
 
 
-def employee_dict(db: Session, e: Employee) -> dict[str, Any]:
-    stores = list(db.execute(
+def employee_dict(db: Session, e: Employee, refs=None) -> dict[str, Any]:
+    stores = refs[0].get(e.id,[]) if refs is not None else list(db.execute(
         select(Store.id, Store.name)
         .join(EmployeeStore, EmployeeStore.store_id == Store.id)
         .where(EmployeeStore.employee_id == e.id)
         .order_by(Store.name)
     ).all())
-    user = db.get(User, e.user_id) if e.user_id else None
+    user = refs[1].get(e.user_id) if refs is not None else (db.get(User, e.user_id) if e.user_id else None)
     return {
         "avatar_photo_id": db.info.get("employee_avatar_ids",{}).get(e.id),
         "id": e.id,
@@ -160,7 +160,12 @@ def list_employees(
         stmt = stmt.where(Employee.full_name.ilike(f"%{q.strip()}%"))
     employees=list(db.scalars(stmt).unique().all())
     db.info["employee_avatar_ids"]=dict(db.execute(select(Photo.entity_id,func.max(Photo.id)).where(Photo.entity_type=="profile_avatar",Photo.entity_id.in_([e.id for e in employees])).group_by(Photo.entity_id)).all())
-    return [_strip_contacts(db,user,employee_dict(db,e)) for e in employees]
+    from app.services.batching import preload
+    users=preload(db,User,[e.user_id for e in employees])
+    stores={}
+    for eid,sid,name in db.execute(select(EmployeeStore.employee_id,Store.id,Store.name).join(Store,Store.id==EmployeeStore.store_id).where(EmployeeStore.employee_id.in_([e.id for e in employees])).order_by(Store.name)):
+        stores.setdefault(eid,[]).append((sid,name))
+    return [_strip_contacts(db,user,employee_dict(db,e,refs=(stores,users))) for e in employees]
 
 
 @router.get("/meta")

@@ -41,7 +41,7 @@ async def lifespan(app:FastAPI):
     stop_worker()
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.19",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.20",lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
@@ -58,22 +58,22 @@ async def performance_headers(request: Request, call_next):
     response.headers["X-SQL-Time-ms"]=f'{metrics["sql_ms"]:.1f}'
     elapsed_ms = (time.perf_counter() - started) * 1000
     response.headers["X-Process-Time-ms"] = f"{elapsed_ms:.1f}"
-    if request.url.path.startswith(("/static/app.1.7.19.","/static/media.1.7.19.","/static/cache.1.7.19.","/static/directories.1.7.19.","/static/prices.1.7.19.")):
+    if request.url.path.startswith(("/static/app.1.7.20.","/static/media.1.7.20.","/static/cache.1.7.20.","/static/directories.1.7.20.","/static/prices.1.7.20.")):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "private, no-store"
     if request.url.path.startswith("/api/") and elapsed_ms >= 150:
-        log.info("Slow API %.1f ms %s %s", elapsed_ms, request.method, request.url.path)
+        log.info("Slow API %.1f ms %s %s sql_count=%d sql_ms=%.1f db_acquire_ms=%.1f", elapsed_ms, request.method, request.url.path, metrics["sql_count"], metrics["sql_ms"], metrics.get("db_acquire_ms",0.0))
     return response
 
 register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.19","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.20","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.19","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.20","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():

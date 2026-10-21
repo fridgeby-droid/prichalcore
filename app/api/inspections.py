@@ -175,7 +175,7 @@ def meta(user=Depends(get_current_user), db: Session = Depends(get_db)):
 @router.get("/forms")
 def forms(user=Depends(get_current_user), db: Session = Depends(get_db)):
     p=require_any_access(db,user,["inspections.conduct","inspections.forms"])
-    allowed=set(assigned_store_ids(db,user))
+    allowed=set(assigned_store_ids(db,user)) if p["data_scope"]!="network" else set()
     result = []
     templates=list(db.scalars(select(InspectionTemplate).where(InspectionTemplate.active.is_(True)).order_by(InspectionTemplate.name)).all())
     ids=[t.id for t in templates]
@@ -296,7 +296,26 @@ def drafts(user=Depends(get_current_user), db: Session = Depends(get_db)):
     q = select(Inspection).where(Inspection.status == "draft").order_by(Inspection.started_at.desc())
     if p["data_scope"]=="own": q=q.where(Inspection.manager_id==user.id)
     elif p["data_scope"]=="stores": q=q.where(Inspection.store_id.in_(assigned_store_ids(db,user) or [-1]))
-    return [{"id": x.id, "store_id": x.store_id, "store_name": _store_name(db,x.store_id), "template_id": x.template_id, "template_name": db.get(InspectionTemplate,x.template_id).name if db.get(InspectionTemplate,x.template_id) else None, "started_at": x.started_at.isoformat() if x.started_at else None} for x in db.scalars(q).all()]
+    q=q.add_columns(Store.name,InspectionTemplate.name).outerjoin(Store,Store.id==Inspection.store_id).outerjoin(InspectionTemplate,InspectionTemplate.id==Inspection.template_id)
+    return [{"id":x.id,"store_id":x.store_id,"store_name":store_name,"template_id":x.template_id,"template_name":template_name,"started_at":x.started_at.isoformat() if x.started_at else None} for x,store_name,template_name in db.execute(q)]
+
+
+@router.get("/conduct-context")
+def conduct_context(user=Depends(get_current_user),db:Session=Depends(get_db)):
+    """Only the data needed to choose a form; full fields load when opened."""
+    require_access(db,user,"inspections.conduct")
+    p=require_any_access(db,user,["inspections.conduct","inspections.control","inspections.history","inspections.forms"])
+    q=select(Store.id,Store.name).where(Store.active.is_(True)).order_by(Store.name)
+    if p["data_scope"]!="network":q=q.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
+    store_rows=[{"id":sid,"name":name} for sid,name in db.execute(q)]
+    p=require_any_access(db,user,["inspections.conduct","inspections.forms"])
+    allowed=set(assigned_store_ids(db,user)) if p["data_scope"]!="network" else set()
+    templates={}
+    for t,sid in db.execute(select(InspectionTemplate,InspectionTemplateStore.store_id).outerjoin(InspectionTemplateStore,InspectionTemplateStore.template_id==InspectionTemplate.id).where(InspectionTemplate.active.is_(True)).order_by(InspectionTemplate.name)):
+        item=templates.setdefault(t.id,{"id":t.id,"name":t.name,"description":t.description,"store_ids":[]})
+        if sid is not None:item["store_ids"].append(sid)
+    visible=[t for t in templates.values() if p["data_scope"]=="network" or not t["store_ids"] or allowed.intersection(t["store_ids"])]
+    return {"meta":{"stores":store_rows},"forms":visible,"drafts":drafts(user=user,db=db)}
 
 
 def _preload_photos(db, obj, ids):

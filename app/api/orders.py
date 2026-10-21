@@ -114,11 +114,16 @@ def _validate_items(db: Session, store_id: int, supplier_id: int, items: list[Or
             if not imp and lim.step_qty and (qty-Decimal(str(lim.min_qty or 0))) % lim.step_qty != 0:raise HTTPException(400,'Количество не кратно шагу')
 
 
-def _order_dict(db: Session, o: Order, include_items: bool = True):
-    store = db.get(Store, o.store_id)
-    supplier = db.get(Supplier, o.supplier_id)
-    creator = db.scalar(select(Employee).where(Employee.user_id == o.created_by))
-    accepted_by = db.get(User, o.accepted_by) if getattr(o, "accepted_by", None) else None
+def _order_dict(db: Session, o: Order, include_items: bool = True, refs=None):
+    if refs is None:
+        store = db.get(Store, o.store_id)
+        supplier = db.get(Supplier, o.supplier_id)
+        creator = db.scalar(select(Employee).where(Employee.user_id == o.created_by))
+        accepted_by = db.get(User, o.accepted_by) if o.accepted_by else None
+    else:
+        stores, suppliers, employees, users = refs
+        store=stores.get(o.store_id);supplier=suppliers.get(o.supplier_id)
+        creator=employees.get(o.created_by);accepted_by=users.get(o.accepted_by)
     data = {
         "id": o.id,
         "store_id": o.store_id,
@@ -190,30 +195,18 @@ def today_availability(user=Depends(get_current_user), db: Session = Depends(get
     sq=select(Store).where(Store.active.is_(True))
     if p["data_scope"]!="network": sq=sq.where(Store.id.in_(assigned_store_ids(db,user) or [-1]))
     stores=list(db.scalars(sq.order_by(Store.name)).all())
+    store_ids=[s.id for s in stores]
+    scheduled={}
+    for store_id,supplier in db.execute(select(OrderScheduleRule.store_id,Supplier).join(Supplier,Supplier.id==OrderScheduleRule.supplier_id).where(OrderScheduleRule.store_id.in_(store_ids),OrderScheduleRule.schedule_type=="order",OrderScheduleRule.weekday==weekday,OrderScheduleRule.active.is_(True),Supplier.active.is_(True)).distinct().order_by(Supplier.name)):
+        scheduled.setdefault(store_id,[]).append(supplier)
+    done={}
+    for store_id,sid,status in db.execute(select(Order.store_id,Order.supplier_id,Order.status).where(Order.store_id.in_(store_ids),Order.created_at>=start,Order.created_at<end,Order.status.in_(DONE_FOR_PROGRESS)).order_by(Order.id)):
+        done.setdefault(store_id,{})[sid]=status
     result = []
     for store in stores:
-        supplier_ids = _scheduled_supplier_ids(db, store.id, weekday)
-        if not supplier_ids:
-            continue
-        suppliers = list(
-            db.scalars(
-                select(Supplier).where(Supplier.id.in_(supplier_ids), Supplier.active.is_(True)).order_by(Supplier.name)
-            ).all()
-        )
-        done_rows = db.execute(
-            select(Order.supplier_id, Order.status)
-            .where(
-                Order.store_id == store.id,
-                Order.supplier_id.in_(supplier_ids),
-                Order.created_at >= start,
-                Order.created_at < end,
-            )
-        ).all()
-        status_by_supplier: dict[int, str] = {}
-        for sid, status in done_rows:
-            # Любая действующая заявка или «Пропуск» закрывает обязательство. Отменённая — нет.
-            if status in DONE_FOR_PROGRESS:
-                status_by_supplier[sid] = status
+        suppliers=scheduled.get(store.id,[])
+        if not suppliers:continue
+        status_by_supplier=done.get(store.id,{})
         supplier_data = [
             {
                 "id": s.id,
@@ -398,7 +391,15 @@ def list_orders(
         q = q.where(Order.created_at >= start)
     if end:
         q = q.where(Order.created_at < end)
-    return [_order_dict(db, o, include_items=False) for o in db.scalars(q).all()]
+    rows=list(db.scalars(q))
+    if not rows:return []
+    from app.services.batching import preload
+    stores=preload(db,Store,[o.store_id for o in rows])
+    suppliers=preload(db,Supplier,[o.supplier_id for o in rows])
+    employees={e.user_id:e for e in db.scalars(select(Employee).where(Employee.user_id.in_({o.created_by for o in rows})))}
+    users=preload(db,User,[o.accepted_by for o in rows])
+    refs=(stores,suppliers,employees,users)
+    return [_order_dict(db,o,include_items=False,refs=refs) for o in rows]
 
 
 @router.get("/{order_id}")

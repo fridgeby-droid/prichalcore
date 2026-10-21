@@ -97,7 +97,7 @@ def _visible_required_articles(db: Session, user, employee) -> list[KnowledgeArt
     stored as JSON and we support both PostgreSQL and SQLite smoke tests.
     """
     p = effective_permission(db, user, "knowledge.read")
-    store_ids = set(scope_store_ids(db, user, "knowledge.read", own_as_assigned=True))
+    store_ids = set(scope_store_ids(db, user, "knowledge.read", own_as_assigned=True)) if p["data_scope"]!="network" else set()
 
     join_on = and_(
         KnowledgeAcknowledgement.article_id == KnowledgeArticle.id,
@@ -172,6 +172,9 @@ def _profile_summary(db: Session, user, employee) -> dict[str, Any]:
 
 def _badge_data(db: Session, user) -> dict[str,int]:
     result={}
+    counts={}
+    def count(key,query):
+        counts[key]=query.scalar_subquery().label(key)
     employee=_employee(db,user)
 
     if _allowed(db,user,"orders.list"):
@@ -182,59 +185,24 @@ def _badge_data(db: Session, user) -> dict[str,int]:
         else:
             ids=_scope_stores(db,user,"orders.list")
             q=q.where(Order.store_id.in_(ids or [-1]))
-        result["orders"]=int(db.scalar(q) or 0)
+        count("orders",q)
 
     if _allowed(db,user,"tasks.my") and employee:
-        result["tasks"]=int(
-            db.scalar(
-                select(func.count(TaskAssignee.id)).where(
-                    TaskAssignee.employee_id==employee.id,
-                    TaskAssignee.status=="new",
-                )
-            ) or 0
-        )
+        count("tasks",select(func.count(TaskAssignee.id)).where(TaskAssignee.employee_id==employee.id,TaskAssignee.status=="new"))
         if _allowed(db,user,"tasks.control"):
-            review=int(
-                db.scalar(
-                    select(func.count(TaskAssignee.id))
-                    .join(TaskV2,TaskV2.id==TaskAssignee.task_id)
-                    .where(TaskAssignee.status=="review",TaskV2.created_by==user.id)
-                ) or 0
-            )
-            result["tasks"] += review
+            count("task_review",select(func.count(TaskAssignee.id)).join(TaskV2,TaskV2.id==TaskAssignee.task_id).where(TaskAssignee.status=="review",TaskV2.created_by==user.id))
 
     if _allowed(db,user,"shifts.control"):
         ids=_scope_stores(db,user,"shifts.control")
-        result["shifts"]=int(
-            db.scalar(
-                select(func.count(ShiftReport.id)).where(
-                    ShiftReport.status=="review",
-                    ShiftReport.store_id.in_(ids or [-1]),
-                )
-            ) or 0
-        )
+        count("shifts",select(func.count(ShiftReport.id)).where(ShiftReport.status=="review",ShiftReport.store_id.in_(ids or [-1])))
     elif employee:
-        result["shifts"]=int(
-            db.scalar(
-                select(func.count(ShiftReport.id)).where(
-                    ShiftReport.employee_id==employee.id,
-                    ShiftReport.status=="rejected",
-                )
-            ) or 0
-        )
+        count("shifts",select(func.count(ShiftReport.id)).where(ShiftReport.employee_id==employee.id,ShiftReport.status=="rejected"))
 
     if _allowed(db,user,"knowledge.read"):
         result["knowledge"]=len(_visible_required_articles(db,user,employee))
 
     if _allowed(db,user,"testing.take") and employee:
-        result["testing"]=int(
-            db.scalar(
-                select(func.count(TrainingAssignment.id)).where(
-                    TrainingAssignment.employee_id==employee.id,
-                    TrainingAssignment.status=="assigned",
-                )
-            ) or 0
-        )
+        count("testing",select(func.count(TrainingAssignment.id)).where(TrainingAssignment.employee_id==employee.id,TrainingAssignment.status=="assigned"))
 
     if _allowed(db,user,"inspections.control"):
         minrow=db.get(AppSetting,"min_inspections_per_week")
@@ -248,14 +216,12 @@ def _badge_data(db: Session, user) -> dict[str,int]:
 
     if _allowed(db,user,"telegram.logs"):
         since=datetime.utcnow()-timedelta(days=7)
-        result["telegram_delivery"]=int(
-            db.scalar(
-                select(func.count(TelegramDeliveryLog.id)).where(
-                    TelegramDeliveryLog.status=="error",
-                    TelegramDeliveryLog.created_at>=since,
-                )
-            ) or 0
-        )
+        count("telegram_delivery",select(func.count(TelegramDeliveryLog.id)).where(TelegramDeliveryLog.status=="error",TelegramDeliveryLog.created_at>=since))
+
+    if counts:
+        result.update({k:int(v or 0) for k,v in db.execute(select(*counts.values())).one()._mapping.items()})
+        review=result.pop("task_review",0)
+        if review:result["tasks"]=result.get("tasks",0)+review
 
     return {k:v for k,v in result.items() if v>0}
 
