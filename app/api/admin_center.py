@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from sqlalchemy.orm import Session
 from app.core.security import get_current_user
 from app.core.permissions import catalog, all_keys, ACCESS_LEVELS, DATA_SCOPES, role_key
@@ -32,8 +32,8 @@ def role_detail(role_key:str,user=Depends(admin_only),db:Session=Depends(get_db)
     r=db.get(RoleDefinition,role_key)
     if not r: raise HTTPException(404,"Роль не найдена")
     perms={x.permission_key:{"access_level":x.access_level,"data_scope":x.data_scope} for x in db.scalars(select(RolePermission).where(RolePermission.role_key==role_key)).all()}
-    users=db.scalars(select(User).where(User.role_key==role_key,User.active.is_(True))).all()
-    return {**role_row(r),"permissions":perms,"users_count":len(users)}
+    users_count=db.scalar(select(func.count(User.id)).where(User.role_key==role_key,User.active.is_(True)))
+    return {**role_row(r),"permissions":perms,"users_count":int(users_count or 0)}
 
 class RoleCreate(BaseModel):
     name:str
@@ -89,8 +89,11 @@ def save_permissions(role_key:str,payload:PermBulk,user=Depends(admin_only),db:S
 def users(user=Depends(admin_only),db:Session=Depends(get_db)):
     rows=[]
     roles={r.key:r for r in db.scalars(select(RoleDefinition)).all()}
+    store_map={}
+    for uid,sid in db.execute(select(UserStore.user_id,UserStore.store_id).order_by(UserStore.store_id)):
+        store_map.setdefault(uid,[]).append(sid)
     for u in db.scalars(select(User).order_by(User.full_name)).all():
-        stores=list(db.scalars(select(UserStore.store_id).where(UserStore.user_id==u.id)).all())
+        stores=store_map.get(u.id,[])
         rk=u.role_key or u.role; r=roles.get(rk)
         rows.append({"id":u.id,"full_name":u.full_name,"telegram_id":u.telegram_id,"status":u.status,"active":u.active,"role_key":rk,"role_name":r.name if r else rk,"store_ids":stores})
     return rows
@@ -106,15 +109,15 @@ def assign_role(user_id:int,payload:dict,user=Depends(admin_only),db:Session=Dep
 @router.get('/audit')
 def audit_list(limit:int=200,user=Depends(admin_only),db:Session=Depends(get_db)):
     result=[]
-    for x in db.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc()).limit(min(limit,500))).all():
-        actor=db.get(User,x.actor_user_id) if x.actor_user_id else None
+    for x,actor in db.execute(select(AdminAuditLog,User).outerjoin(User,User.id==AdminAuditLog.actor_user_id).order_by(AdminAuditLog.created_at.desc()).limit(max(0,min(limit,500)))):
         result.append({"id":x.id,"actor":actor.full_name if actor else 'Система',"action":x.action,"entity_type":x.entity_type,"entity_id":x.entity_id,"details":x.details_json,"created_at":x.created_at.isoformat()})
     return result
 
 @router.get('/system')
 def system(user=Depends(admin_only),db:Session=Depends(get_db)):
     keys=['company_name','app_timezone','min_inspections_per_week','handover_morning_window','handover_evening_window','day_shift_hours','night_shift_hours','default_order_limits','module_states']
-    return {k:(db.get(AppSetting,k).value_json if db.get(AppSetting,k) else None) for k in keys}
+    values={r.key:r.value_json for r in db.scalars(select(AppSetting).where(AppSetting.key.in_(keys)))}
+    return {k:values.get(k) for k in keys}
 
 @router.put('/system')
 def save_system(payload:dict,user=Depends(admin_only),db:Session=Depends(get_db)):

@@ -506,6 +506,8 @@ def db_health():
     query_samples_ms = []
     probe = None
     db_name = "unknown"
+    metadata_ms = 0.0
+    transaction_finish_ms = 0.0
 
     try:
         for _ in range(sample_count):
@@ -514,24 +516,35 @@ def db_health():
             query_finished = time.perf_counter()
             query_samples_ms.append((query_finished - query_started) * 1000)
 
-        try:
-            db_name = conn.execute(text("SELECT current_database()")) .scalar_one()
-        except Exception:
-            db_name = "sqlite"
+        metadata_started=time.perf_counter()
+        db_name=conn.execute(text("SELECT current_database()")).scalar_one() if engine.dialect.name=="postgresql" else engine.dialect.name
+        metadata_ms=(time.perf_counter()-metadata_started)*1000
     finally:
         release_started = time.perf_counter()
-        conn.close()
-        released_at = time.perf_counter()
+        try:
+            transaction_started=time.perf_counter()
+            conn.rollback()
+            transaction_finish_ms=(time.perf_counter()-transaction_started)*1000
+        finally:
+            pool_return_started=time.perf_counter()
+            conn.close()
+            released_at = time.perf_counter()
 
     total_finished = time.perf_counter()
     ordered = sorted(query_samples_ms)
     p95_index = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * 0.95 + 0.999999)))
 
     return {
+        "database": engine.dialect.name,
         "probe": probe,
         "database_name": db_name,
         "sample_count": sample_count,
         "checkout_ms": round((checked_out_at - checkout_started) * 1000, 2),
+        "query_warm_avg_ms": round(sum(query_samples_ms[1:])/len(query_samples_ms[1:]),2),
+        "query_warm_median_ms": round(sorted(query_samples_ms[1:])[len(query_samples_ms[1:])//2],2),
+        "metadata_ms": round(metadata_ms,2),
+        "transaction_finish_ms": round(transaction_finish_ms,2),
+        "pool_return_ms": round((released_at-pool_return_started)*1000,2),
         "query_first_ms": round(query_samples_ms[0], 2),
         "query_min_ms": round(min(query_samples_ms), 2),
         "query_avg_ms": round(sum(query_samples_ms) / len(query_samples_ms), 2),
