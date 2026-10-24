@@ -412,7 +412,7 @@ def schedule(user=Depends(get_current_user),db:Session=Depends(get_db)):
     stores=[row(x,"id","name","active") for x in db.scalars(sq.order_by(Store.name)).all()]
     suppliers=[row(x,"id","name","active") for x in db.scalars(select(Supplier).order_by(Supplier.name)).all()]
     rules=[row(x,"id","store_id","supplier_id","schedule_type","weekday","active") for x in db.scalars(rq.order_by(OrderScheduleRule.store_id,OrderScheduleRule.weekday)).all()]
-    return {"stores":stores,"suppliers":suppliers,"rules":rules}
+    return {"stores":stores,"suppliers":suppliers,"rules":rules,"data_scope":p["data_scope"]}
 
 
 @router.put("/schedule")
