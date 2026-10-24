@@ -426,6 +426,33 @@ def save_schedule(payload:ScheduleIn,user=Depends(get_current_user),db:Session=D
 
 
 
+class BulkScheduleIn(BaseModel):
+    supplier_id: int = Field(gt=0)
+    store_ids: list[int] = Field(min_length=1, max_length=500)
+    weekdays: list[int] = Field(min_length=1, max_length=7)
+
+
+@router.put("/schedule/bulk")
+def save_bulk_schedule(payload: BulkScheduleIn, user=Depends(get_current_user), db: Session=Depends(get_db)):
+    require_access(db,user,"orders.schedule_edit","edit")
+    ids=sorted(set(payload.store_ids)); days=sorted(set(payload.weekdays))
+    if any(i<=0 for i in ids) or any(d<0 or d>6 for d in days):
+        raise HTTPException(422,"Некорректные магазины или дни недели")
+    for sid in ids:
+        assert_store_scope(db,user,"orders.schedule_edit",sid,minimum="edit",own_as_assigned=True)
+    supplier=db.get(Supplier,payload.supplier_id)
+    if not supplier or not supplier.active:
+        raise HTTPException(400,"Выберите активного поставщика")
+    # Lock stores in deterministic order; validate the whole selection before changes.
+    stores=list(db.scalars(select(Store).where(Store.id.in_(ids)).order_by(Store.id).with_for_update()).all())
+    if len(stores)!=len(ids) or any(not s.active for s in stores):
+        raise HTTPException(400,"Выберите существующие активные магазины")
+    db.execute(delete(OrderScheduleRule).where(OrderScheduleRule.store_id.in_(ids),OrderScheduleRule.supplier_id==payload.supplier_id,OrderScheduleRule.schedule_type=="order"))
+    db.add_all([OrderScheduleRule(store_id=sid,supplier_id=payload.supplier_id,schedule_type="order",weekday=day,active=True) for sid in ids for day in days])
+    db.commit()
+    return {"ok":True,"store_count":len(ids),"store_ids":ids,"weekdays":days}
+
+
 def _norm_header(value: Any) -> str:
     return str(value or "").strip().lower().replace("ё", "е")
 

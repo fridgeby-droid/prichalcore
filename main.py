@@ -41,7 +41,7 @@ async def lifespan(app:FastAPI):
     stop_worker()
     stop_scheduler()
 
-app=FastAPI(title="Причал Core",version="1.7.22",lifespan=lifespan)
+app=FastAPI(title="Причал Core",version="1.7.24",lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
@@ -58,7 +58,7 @@ async def performance_headers(request: Request, call_next):
     response.headers["X-SQL-Time-ms"]=f'{metrics["sql_ms"]:.1f}'
     elapsed_ms = (time.perf_counter() - started) * 1000
     response.headers["X-Process-Time-ms"] = f"{elapsed_ms:.1f}"
-    if request.url.path.startswith(("/static/screens.1.7.22.","/static/app.1.7.22.","/static/media.1.7.22.","/static/cache.1.7.22.","/static/directories.1.7.22.","/static/prices.1.7.22.")):
+    if request.url.path.startswith(("/static/order-tools.1.7.24.","/static/screens.1.7.24.","/static/app.1.7.24.","/static/media.1.7.24.","/static/cache.1.7.24.","/static/directories.1.7.24.","/static/prices.1.7.24.")):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "private, no-store"
@@ -70,10 +70,10 @@ register_routers(app)
 app.mount("/static",StaticFiles(directory=BASE/"miniapp"),name="static")
 
 @app.get("/")
-def root():return {"service":"prichal-core","version":"1.7.22","miniapp":"/miniapp"}
+def root():return {"service":"prichal-core","version":"1.7.24","miniapp":"/miniapp"}
 
 @app.get("/health")
-def health():return {"status":"ok","service":"prichal-core","version":"1.7.22","environment":APP_ENV}
+def health():return {"status":"ok","service":"prichal-core","version":"1.7.24","environment":APP_ENV}
 
 @app.get("/db-health")
 def database_health():

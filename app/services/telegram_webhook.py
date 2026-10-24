@@ -11,7 +11,10 @@ from app.services.storage import mirror_telegram_photo_to_s3
 def handle_update(update:dict):
     message=update.get("message") or {}
     if message.get("photo"):
-        send_message(message["chat"]["id"],"Фото теперь добавляются прямо в Mini App: откройте нужный раздел и нажмите «Добавить фото».")
+        chat=message.get("chat") or {}
+        # Upload guidance belongs to the private bot conversation, not supplier groups.
+        if chat.get("type")=="private" and chat.get("id"):
+            send_message(chat["id"],"Фото теперь добавляются прямо в Mini App: откройте нужный раздел и нажмите «Добавить фото».")
         return
     msg=update.get("message") or {}
     chat=msg.get("chat") or {}
