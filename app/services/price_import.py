@@ -101,7 +101,7 @@ def fetch_catalog(point,price=None):
 
 def locked_catalog(db,cid,token=None):
     row=db.get(Catalog,cid,with_for_update=True,populate_existing=True)
-    if not row or token is not None and row.job_token!=token:raise ImportErrorSafe('Загрузка заменена более новой задачей')
+    if not row or row.status=="deleted" or token is not None and row.job_token!=token:raise ImportErrorSafe('Загрузка заменена более новой задачей')
     return row
 
 def apply_snapshot(cid,token,data):
@@ -212,7 +212,7 @@ def selected_photos(db,items):
 def claim_job():
     now=datetime.utcnow()
     with database.session_scope() as db:
-        row=db.scalar(select(Catalog).where(or_(Catalog.status=='queued',(Catalog.status=='running')&(Catalog.lease_until<now),Catalog.next_sync_at<=now)).order_by(Catalog.id).with_for_update(skip_locked=True).limit(1))
+        row=db.scalar(select(Catalog).where(Catalog.status!="deleted",or_(Catalog.status=='queued',(Catalog.status=='running')&(Catalog.lease_until<now),Catalog.next_sync_at<=now)).order_by(Catalog.id).with_for_update(skip_locked=True).limit(1))
         if not row:return None
         row.status='running';row.job_token=str(uuid4());row.lease_until=now+timedelta(minutes=10);row.next_sync_at=None;row.error=None
         return row.id,row.job_token,row.point_id,row.external_id,row.connection,row.base_url

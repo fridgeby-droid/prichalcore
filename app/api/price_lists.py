@@ -14,7 +14,7 @@ from app.services.storage import s3_photo_response
 router=APIRouter(prefix='/api/admin-center/price-lists',tags=['price-lists'])
 def catalog(db,cid):
     row=db.scalar(select(Catalog).where(Catalog.id==cid).with_for_update())
-    if not row:raise HTTPException(404,'Прайс не найден')
+    if not row or row.status=='deleted':raise HTTPException(404,'Прайс не найден')
     return row
 
 def summary(r):
@@ -25,7 +25,7 @@ def listing(user=Depends(admin_only),db:Session=Depends(get_db)):
     error=None
     try:service.settings()
     except service.ImportErrorSafe as e:error=str(e)
-    return {'configured':not error,'config_error':error,'catalogs':[summary(r) for r in db.scalars(select(Catalog).order_by(Catalog.id))],'suppliers':[{'id':s.id,'name':s.name} for s in db.scalars(select(Supplier).where(Supplier.active.is_(True)).order_by(Supplier.name))]}
+    return {'configured':not error,'config_error':error,'catalogs':[summary(r) for r in db.scalars(select(Catalog).where(Catalog.status!="deleted").order_by(Catalog.id))],'suppliers':[{'id':s.id,'name':s.name} for s in db.scalars(select(Supplier).where(Supplier.active.is_(True)).order_by(Supplier.name))]}
 
 @router.get('/remote')
 def remote(point_id:str,user=Depends(admin_only),db:Session=Depends(get_db)):
@@ -44,11 +44,28 @@ def connect(payload:Connect,user=Depends(admin_only),db:Session=Depends(get_db))
     except service.ImportErrorSafe as e:raise HTTPException(503,str(e))
     supplier=db.get(Supplier,payload.supplier_id)
     if not supplier or not supplier.active:raise HTTPException(400,'Выберите активного поставщика')
-    existing=db.scalar(select(Catalog).where(Catalog.connection==connection,Catalog.base_url==base,Catalog.point_id==payload.point_id,Catalog.external_id==payload.external_id))
-    if existing:raise HTTPException(409,'Прайс уже подключён')
+    existing=db.scalar(select(Catalog).where(Catalog.connection==connection,Catalog.base_url==base,Catalog.point_id==payload.point_id,Catalog.external_id==payload.external_id).with_for_update())
+    if existing and existing.status!='deleted':raise HTTPException(409,'Прайс уже подключён')
+    if existing:
+        existing.status='queued';existing.supplier_id=payload.supplier_id;existing.job_token=str(uuid4())
+        existing.error=None;existing.failures=0;existing.lease_until=None;existing.next_sync_at=None
+        audit(db,user,'reconnect','price_list',existing.id);db.commit()
+        return summary(existing)
     row=Catalog(connection=connection,base_url=base,point_id=payload.point_id,external_id=payload.external_id,name='Прайс '+payload.external_id,supplier_id=payload.supplier_id,status='queued')
     db.add(row);db.flush();audit(db,user,'connect','price_list',row.id);db.commit()
     return summary(row)
+
+@router.delete('/{cid}')
+def disconnect(cid:int,user=Depends(admin_only),db:Session=Depends(get_db)):
+    row=catalog(db,cid)
+    row.status='deleted';row.auto_sync=False;row.next_sync_at=None;row.lease_until=None
+    row.job_token=str(uuid4());row.error=None
+    products=list(db.scalars(select(Product).join(Item,Item.product_id==Product.id).where(Item.price_list_id==cid).order_by(Product.id).with_for_update()).all())
+    for product in products:product.active=False
+    for item in db.scalars(select(Item).where(Item.price_list_id==cid)):item.present=False
+    audit(db,user,'disconnect','price_list',cid,{'disabled_products':len(products)})
+    db.commit()
+    return {'ok':True,'disabled_products':len(products)}
 
 @router.post('/{cid}/sync')
 def sync(cid:int,user=Depends(admin_only),db:Session=Depends(get_db)):
@@ -73,6 +90,7 @@ def configure(cid:int,payload:Settings,user=Depends(admin_only),db:Session=Depen
 
 @router.get('/{cid}/items')
 def items(cid:int,user=Depends(admin_only),db:Session=Depends(get_db)):
+    catalog(db,cid)
     rows=db.execute(select(Item,Product).join(Product,Product.id==Item.product_id).where(Item.price_list_id==cid).order_by(Product.name,Item.id)).all()
     photos=service.selected_photos(db,[i for i,p in rows])
     return [{'id':i.id,'product_id':p.id,'name':p.name,'unit':p.unit,'present':i.present,'step':str(i.step) if i.step else None,'ready':bool(i.present and i.step and i.confirmed_unit==p.unit),'image_url':f'/api/admin-center/price-lists/items/{i.id}/photo' if photos.get(p.id) else None} for i,p in rows]
