@@ -490,8 +490,16 @@ def init_db():
                 from app.db.usability_migration import upgrade as upgrade_usability
                 upgrade_usability(engine)
                 lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('usability-1.7.19')"));lock.commit()
+            if 'order-attachments-1.7.32' not in done:
+                # Existing installations skip _init_legacy/create_all. Register
+                # this table explicitly and commit DDL + marker atomically.
+                models.OrderAttachment.__table__.create(lock,checkfirst=True)
+                lock.execute(text("INSERT INTO core_schema_versions(version) VALUES ('order-attachments-1.7.32')"));lock.commit()
         finally:
             if engine.dialect.name=='postgresql':
+                # A failed DDL leaves PostgreSQL's transaction aborted. Roll it
+                # back before unlocking so the original migration error survives.
+                lock.rollback()
                 lock.execute(text("SELECT pg_advisory_unlock(714118)"));lock.commit()
 
 
