@@ -237,17 +237,70 @@ def create_product(payload: ProductIn, user=Depends(get_current_user), db: Sessi
     return row(obj, "id", "name", "supplier_id", "category_id", "unit", "active")
 
 
+class BulkProductsIn(BaseModel):
+    ids: list[int] = Field(min_length=1,max_length=500)
+    changes: dict[str,Any]
+    expected_units: dict[int,str] = Field(default_factory=dict)
+
+
+@router.patch("/products/bulk")
+def bulk_products(payload:BulkProductsIn,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    from app.db.models import ImportedPriceItem,ImportedPriceList
+    from app.api.admin_center import audit
+    changes=payload.changes
+    if not changes or set(changes)-{'supplier_id','category_id','unit','step_qty','active'}:
+        raise HTTPException(422,"Выберите поля для массового изменения")
+    if set(changes)!={'active'}:require_access(db,user,'orders.products_edit','edit')
+    if 'active' in changes:require_access(db,user,'orders.products_disable','edit')
+    for key in ('supplier_id','category_id'):
+        if key in changes and not (key=='category_id' and changes[key] is None):
+            if type(changes[key]) is not int or changes[key]<=0:raise HTTPException(422,'Некорректный поставщик или категория')
+    ids=sorted(set(payload.ids))
+    catalogs=list(db.scalars(select(ImportedPriceItem.price_list_id).where(ImportedPriceItem.product_id.in_(ids)).distinct()))
+    if catalogs:
+        list(db.scalars(select(ImportedPriceList).where(ImportedPriceList.id.in_(catalogs)).order_by(ImportedPriceList.id).with_for_update()))
+    products=list(db.scalars(select(Product).where(Product.id.in_(ids)).order_by(Product.id).with_for_update().execution_options(populate_existing=True)))
+    if len(products)!=len(ids):raise HTTPException(409,'Список товаров изменился. Обновите справочник')
+    for product in products:
+        if 'unit' in changes and isinstance(changes['unit'],str) and changes['unit'].strip()!=product.unit and 'step_qty' not in changes:
+            raise HTTPException(422,'При смене единицы укажите новый положительный шаг')
+        if 'step_qty' in changes or 'unit' in changes:
+            if payload.expected_units.get(product.id)!=product.unit:raise HTTPException(409,'Единицы товаров изменились. Обновите справочник и повторите выбор')
+    bulk={
+        'products':{p.id:p for p in products},
+        'items':{i.product_id:i for i in db.scalars(select(ImportedPriceItem).where(ImportedPriceItem.product_id.in_(ids)).execution_options(populate_existing=True))},
+        'suppliers':{x.id:x for x in db.scalars(select(Supplier))},
+        'categories':{x.id:x for x in db.scalars(select(Category))},
+        'limits':{x.product_id:x for x in db.scalars(select(ProductOrderLimit).where(ProductOrderLimit.product_id.in_(ids),ProductOrderLimit.store_id.is_(None)))},
+    }
+    updated=[]
+    with db.no_autoflush:
+        for product in products:
+            patch=dict(changes)
+            patch['expected_unit']=changes.get('unit',product.unit).strip() if isinstance(changes.get('unit',product.unit),str) else product.unit
+            # Preserve permission semantics for active-only operations.
+            if 'step_qty' not in changes:patch.pop('expected_unit',None)
+            updated.append(_update_product(product.id,patch,user,db,commit=False,bulk=bulk))
+    audit(db,user,'bulk_update','products',None,{'ids':ids,'fields':sorted(changes)})
+    _commit_or_conflict(db,'Изменения не применены: конфликт товаров у поставщика')
+    return {'ok':True,'count':len(ids),'products':updated}
+
+
 @router.patch("/products/{product_id}")
 def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_current_user), db: Session = Depends(get_db)):
+    return _update_product(product_id,payload,user,db)
+
+
+def _update_product(product_id, payload, user, db, commit=True, bulk=None):
     from decimal import Decimal, InvalidOperation
     from app.db.models import ImportedPriceItem, ImportedPriceList
     if set(payload)!={"active"}:require_access(db,user,"orders.products_edit","edit")
     if "active" in payload:require_access(db,user,"orders.products_disable","edit")
-    item=db.scalar(select(ImportedPriceItem).where(ImportedPriceItem.product_id==product_id))
-    if item:
+    item=bulk["items"].get(product_id) if bulk is not None else db.scalar(select(ImportedPriceItem).where(ImportedPriceItem.product_id==product_id))
+    if item and bulk is None:
         db.scalar(select(ImportedPriceList).where(ImportedPriceList.id==item.price_list_id).with_for_update())
         db.refresh(item)
-    obj=db.scalar(select(Product).where(Product.id==product_id).with_for_update().execution_options(populate_existing=True))
+    obj=bulk["products"].get(product_id) if bulk is not None else db.scalar(select(Product).where(Product.id==product_id).with_for_update().execution_options(populate_existing=True))
     if not obj:raise HTTPException(404,"Товар не найден")
     overrides=dict(item.overrides or {}) if item else {}
     if item and "supplier_id" in payload and payload['supplier_id']!=obj.supplier_id:
@@ -268,10 +321,11 @@ def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_cu
     for key,model in [('supplier_id',Supplier),('category_id',Category)]:
         if key in payload:
             value=payload[key]
-            if (value is None and key=='supplier_id') or (value is not None and not db.get(model,value)):raise HTTPException(400,"Не найден поставщик или категория")
+            ref=bulk["suppliers" if key=="supplier_id" else "categories"].get(value) if bulk is not None else db.get(model,value) if value is not None else None
+            if (value is None and key=='supplier_id') or (value is not None and not ref):raise HTTPException(400,"Не найден поставщик или категория")
             setattr(obj,key,value)
     if obj.category_id:
-        cat=db.get(Category,obj.category_id)
+        cat=bulk["categories"].get(obj.category_id) if bulk is not None else db.get(Category,obj.category_id)
         if cat.supplier_id and cat.supplier_id!=obj.supplier_id:raise HTTPException(400,"Категория другого поставщика")
     if item and old_unit!=obj.unit:item.confirmed_unit=None
     if 'step_qty' in payload:
@@ -283,7 +337,7 @@ def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_cu
             if payload.get('expected_unit')!=obj.unit:raise HTTPException(409,"Единица изменилась. Проверьте и подтвердите шаг")
             item.step=step;item.confirmed_unit=obj.unit
         else:
-            lim=db.scalar(select(ProductOrderLimit).where(ProductOrderLimit.product_id==product_id,ProductOrderLimit.store_id.is_(None)))
+            lim=bulk["limits"].get(product_id) if bulk is not None else db.scalar(select(ProductOrderLimit).where(ProductOrderLimit.product_id==product_id,ProductOrderLimit.store_id.is_(None)))
             if not lim:lim=ProductOrderLimit(product_id=product_id);db.add(lim)
             lim.step_qty=step;lim.active=True
     if 'active' in payload:
@@ -293,7 +347,7 @@ def update_product(product_id: int, payload: dict[str, Any], user=Depends(get_cu
     if item:
         item.overrides=overrides
         obj.active=bool(item.present and item.step and item.confirmed_unit==obj.unit and not overrides.get('disabled'))
-    _commit_or_conflict(db,"Не удалось изменить товар")
+    if commit:_commit_or_conflict(db,"Не удалось изменить товар")
     return row(obj,"id","name","supplier_id","category_id","unit","active")
 
 
