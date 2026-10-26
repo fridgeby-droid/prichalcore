@@ -454,12 +454,34 @@ def combine_bulk_order_deliveries(db: Session, deliveries: list[dict]):
             continue
         groups.setdefault(entry.chat_id, []).append((entry, result))
     separator = '\n\n──────────\n\n'
+    blocks = {}; senders = {}
+    for entries in groups.values():
+        for entry, _ in entries:
+            order = db.get(Order, entry.entity_id)
+            if not order:
+                blocks[entry.id] = entry.payload_json.get('text', '')
+                continue
+            values = order_template_values(db, order)
+            blocks[entry.id] = (
+                f"🏪 <b>{escape(values['store_name'])}</b>\n"
+                f"🚚 Поставщик: <b>{escape(values['supplier_name'])}</b>\n"
+                f"📅 {escape(values['date'])} · Заявка №{order.id}\n\n"
+                f"📦 <b>Заявка:</b>\n{values['order_items']}"
+            )
+            if (order.comment or '').strip():
+                blocks[entry.id] += '\n\n💬 ' + escape(order.comment.strip())
+            sender = db.scalar(select(Employee).where(Employee.user_id == order.accepted_by))
+            senders[entry.id] = sender.full_name if sender else values['accepted_by']
+    def text_for(batch):
+        names = list(dict.fromkeys(senders[x.id] for x, _ in batch if x.id in senders))
+        footer = ('\n\n✅ Отправил: ' + escape(', '.join(names))) if names else ''
+        return separator.join(blocks[x.id] for x, _ in batch) + footer
     def flush(batch):
-        if len(batch) < 2:
+        if not batch:
             return
         leader = batch[0][0]
         payload = dict(leader.payload_json or {})
-        payload['text'] = separator.join(x.payload_json.get('text', '') for x, _ in batch)
+        payload['text'] = text_for(batch)
         payload['bulk_order_ids'] = [x.entity_id for x, _ in batch]
         payload['grouped_log_ids'] = [x.id for x, _ in batch[1:]]
         leader.payload_json = payload
@@ -469,12 +491,10 @@ def combine_bulk_order_deliveries(db: Session, deliveries: list[dict]):
                 entry.status = 'grouped'
                 entry.payload_json = {**entry.payload_json, 'group_log_id': leader.id}
     for entries in groups.values():
-        batch = []; size = 0
+        batch = []
         for entry, result in entries:
-            # Conservative UTF-16 HTML budget, so formatting/entities cannot overflow.
-            n = len(entry.payload_json.get('text', '').encode('utf-16-le')) // 2
-            extra = len(separator) if batch else 0
-            if batch and size + extra + n > 3800:
-                flush(batch); batch = []; size = 0; extra = 0
-            batch.append((entry, result)); size += extra + n
+            candidate = batch + [(entry, result)]
+            if batch and len(text_for(candidate).encode('utf-16-le')) // 2 > 3800:
+                flush(batch); batch = []
+            batch.append((entry, result))
         flush(batch)

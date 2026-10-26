@@ -48,3 +48,19 @@ def test_group_retry_and_exhaustion_propagate(env,monkeypatch):
         lead=next(r for r in logs if r.status=='retry');lead.payload_json={**lead.payload_json,'_attempt':5};lead.sent_at=datetime.utcnow()-timedelta(minutes=2)
     delivery_worker.process_deliveries()
     with database.session_scope() as db:assert all(r.status=='error' for r in db.scalars(select(TelegramDeliveryLog)))
+
+def test_bulk_footer_once_and_empty_comment_omitted(env):
+    c,_,ids,auth,_=env;b,p=setup_order(env);b2,p2=setup_order_second(env)
+    first=c.post('/api/orders',json={**b,'items':[{'product_id':p,'quantity':'1'}]},headers=auth).json()['id']
+    second=c.post('/api/orders',json={**b2,'comment':'Не забыть <пакеты> & чек'},headers=auth).json()['id']
+    with database.session_scope() as db:
+        dst=TelegramDestination(title='Combined',chat_id=-100,active=True);db.add(dst);db.flush()
+        for x in [b,b2]:db.add(TelegramRoute(event_type='order_accepted',target_type='supplier',target_id=x['supplier_id'],destination_id=dst.id,active=True))
+    r=c.post('/api/orders/bulk',json={'ids':[first,second],'action':'accepted'},headers=auth);assert r.status_code==200,r.text
+    with database.session_scope() as db:
+        lead=db.scalar(select(TelegramDeliveryLog).where(TelegramDeliveryLog.status=='pending'))
+        text=lead.payload_json['text']
+        assert text.count('Отправил:')==1 and text.endswith('Отправил: Admin')
+        assert 'Создал:' not in text and 'Проверил:' not in text
+        assert 'Без комментария' not in text and text.count('💬')==1
+        assert '&lt;пакеты&gt; &amp; чек' in text
