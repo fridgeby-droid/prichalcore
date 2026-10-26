@@ -16,7 +16,12 @@ def process_deliveries():
         items=[]
         for r in rows:
             payload=dict(r.payload_json or {});attempt=int(payload.get('_attempt',0))+1
-            if attempt>5:r.status='error';r.error='Доставка не подтверждена после 5 попыток';continue
+            if attempt>5:
+                r.status='error';r.error='Доставка не подтверждена после 5 попыток'
+                for child in db.scalars(select(TelegramDeliveryLog).where(TelegramDeliveryLog.id.in_(payload.get('grouped_log_ids', [])))):
+                    if (child.payload_json or {}).get('group_log_id')==r.id:
+                        child.status='error';child.error=r.error
+                continue
             payload['_attempt']=attempt;r.payload_json=payload;r.status='sending';r.sent_at=now
             refs=[]
             for ref in payload.get('photos',[]):
@@ -42,3 +47,7 @@ def process_deliveries():
             r=db.get(TelegramDeliveryLog,identity)
             if r and r.status=='sending':
                 r.status=status;r.telegram_message_id=message_id;r.sent_at=datetime.utcnow();r.error='Не удалось отправить уведомление' if status in {'error','retry'} else None
+                for child in db.scalars(select(TelegramDeliveryLog).where(TelegramDeliveryLog.id.in_(payload.get('grouped_log_ids', [])))):
+                    if (child.payload_json or {}).get('group_log_id') == r.id:
+                        child.status = 'grouped' if status == 'retry' else status
+                        child.telegram_message_id=message_id;child.sent_at=r.sent_at;child.error=r.error

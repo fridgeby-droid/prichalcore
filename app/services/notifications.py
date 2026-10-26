@@ -437,3 +437,44 @@ def notify_test_assignment(db: Session, assignment_id: int):
         db, employee_id=assignment.employee_id, event_type="test_assigned", entity_type="training_assignment",
         entity_id=assignment.id, text=rendered["text"], reply_markup=rendered.get("reply_markup"), use_default_button=False,
     )
+
+
+def combine_bulk_order_deliveries(db: Session, deliveries: list[dict]):
+    """Combine only new queue entries from this transaction, never earlier deliveries."""
+    groups = {}
+    for item in deliveries:
+        result = item.get('delivery') or {}
+        if result.get('status') != 'pending' or result.get('duplicate'):
+            continue
+        entry = db.get(TelegramDeliveryLog, result.get('log_id'))
+        if entry is None or entry.status != 'pending':
+            continue
+        # Order notifications have no media. Keep any future media payload independent.
+        if (entry.payload_json or {}).get('photos'):
+            continue
+        groups.setdefault(entry.chat_id, []).append((entry, result))
+    separator = '\n\n──────────\n\n'
+    def flush(batch):
+        if len(batch) < 2:
+            return
+        leader = batch[0][0]
+        payload = dict(leader.payload_json or {})
+        payload['text'] = separator.join(x.payload_json.get('text', '') for x, _ in batch)
+        payload['bulk_order_ids'] = [x.entity_id for x, _ in batch]
+        payload['grouped_log_ids'] = [x.id for x, _ in batch[1:]]
+        leader.payload_json = payload
+        for entry, result in batch:
+            result['group_log_id'] = leader.id
+            if entry.id != leader.id:
+                entry.status = 'grouped'
+                entry.payload_json = {**entry.payload_json, 'group_log_id': leader.id}
+    for entries in groups.values():
+        batch = []; size = 0
+        for entry, result in entries:
+            # Conservative UTF-16 HTML budget, so formatting/entities cannot overflow.
+            n = len(entry.payload_json.get('text', '').encode('utf-16-le')) // 2
+            extra = len(separator) if batch else 0
+            if batch and size + extra + n > 3800:
+                flush(batch); batch = []; size = 0; extra = 0
+            batch.append((entry, result)); size += extra + n
+        flush(batch)

@@ -13,7 +13,7 @@ from app.core.config import APP_TIMEZONE
 from app.core.security import get_current_user
 from app.core.permissions import require_access, assigned_store_ids, assert_store_scope, assert_own_or_scope
 from app.db.database import get_db
-from app.services.notifications import send_order_accepted
+from app.services.notifications import send_order_accepted, combine_bulk_order_deliveries
 from app.db.models import (
     ImportedPriceItem, ImportedPriceList,
     Employee,
@@ -513,6 +513,7 @@ def bulk_orders(payload: BulkOrderIn,user=Depends(get_current_user),db:Session=D
             db.delete(o)
         else:
             deliveries.append({"order_id":o.id,"delivery":_apply_order_update(db,o,{"status":payload.action},user)})
+    combine_bulk_order_deliveries(db,deliveries)
     db.commit()
     return {"ok":True,"count":len(rows),"deliveries":deliveries}
 
