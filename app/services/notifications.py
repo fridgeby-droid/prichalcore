@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.config import APP_URL
 from app.core.permissions import has_access, role_key
 from app.db.models import (
-    Employee, EmployeeNotificationPreference, EmployeeStore, KnowledgeArticle,
+    OrderAttachment, Employee, EmployeeNotificationPreference, EmployeeStore, KnowledgeArticle,
     KnowledgeSection, Order, OrderItem, Photo, Product, ShiftReport, ShiftReportValue,
     ShiftTemplateField, Store, Supplier, TaskV2, TelegramDeliveryLog,
     TelegramDestination, TelegramRoute, TrainingAssignment, TrainingTest, User,
@@ -227,13 +227,22 @@ def send_order_accepted(db: Session, order_id: int, force: bool = False) -> dict
     if not order:
         return {"status": "not_found"}
     rendered = render_event(db, "order_accepted", order_template_values(db, order))
-    return _send_group(
+    result = _send_group(
         db, event_type="order_accepted", target_type="supplier", target_id=order.supplier_id,
         entity_type="order", entity_id=order.id, text=rendered["text"], force=force,
         reply_markup=rendered.get("reply_markup"), send_media=bool(rendered.get("send_media")),
         media_order=rendered.get("media_order") or "text_first",
         photo_caption=rendered.get("photo_caption_rendered"),
     )
+    if result.get('status')=='pending' and not result.get('duplicate'):
+        entry=db.get(TelegramDeliveryLog,result['log_id'])
+        store=db.get(Store,order.store_id)
+        docs=[{'id':a.id,'s3_key':a.s3_key,'filename':a.filename,'mime_type':a.mime_type,
+               'caption':f"Заявка №{order.id} · {store.name if store else order.store_id}"}
+              for a in db.scalars(select(OrderAttachment).where(OrderAttachment.order_id==order.id,OrderAttachment.active.is_(True)).order_by(OrderAttachment.id))]
+        entry.payload_json={**entry.payload_json,'documents':docs}
+    return result
+
 
 
 def _handover_answers_html(db: Session, report: ShiftReport) -> str:
@@ -482,6 +491,7 @@ def combine_bulk_order_deliveries(db: Session, deliveries: list[dict]):
         leader = batch[0][0]
         payload = dict(leader.payload_json or {})
         payload['text'] = text_for(batch)
+        payload['documents'] = [doc for x, _ in batch for doc in (x.payload_json or {}).get('documents', [])]
         payload['bulk_order_ids'] = [x.entity_id for x, _ in batch]
         payload['grouped_log_ids'] = [x.id for x, _ in batch[1:]]
         leader.payload_json = payload

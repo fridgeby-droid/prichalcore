@@ -1128,3 +1128,16 @@ class ImportedPriceImage(Base):
     media_id: Mapped[str|None]=mapped_column(ForeignKey('media_assets.id'),nullable=True)
     error: Mapped[str|None]=mapped_column(String(240),nullable=True)
     __table_args__=(UniqueConstraint('item_id','external_id',name='uq_imported_price_image'),)
+
+
+class OrderAttachment(Base):
+    __tablename__ = 'order_attachments'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey('orders.id', ondelete='CASCADE'), index=True)
+    uploaded_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    filename: Mapped[str] = mapped_column(String(200))
+    mime_type: Mapped[str] = mapped_column(String(120))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    s3_key: Mapped[str] = mapped_column(String(1024))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)

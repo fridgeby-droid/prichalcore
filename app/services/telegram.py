@@ -56,3 +56,12 @@ def miniapp_keyboard():
         "keyboard": [[{"text": "⚓ Открыть Причал Core", "web_app": {"url": f"{APP_URL.rstrip('/')}/miniapp"}}]],
         "resize_keyboard": True,
     }
+
+
+def send_document(chat_id:int, filename:str, content:bytes, mime_type:str, caption:str=''):
+    if not BOT_TOKEN:raise RuntimeError('BOT_TOKEN is not configured')
+    with httpx.Client(timeout=60) as client:
+        response=client.post(f'{API}/sendDocument',data={'chat_id':str(chat_id),'caption':caption[:1000]},files={'document':(filename,content,mime_type)})
+        response.raise_for_status();data=response.json()
+        if not data.get('ok'):raise RuntimeError('Telegram document delivery failed')
+        return data
